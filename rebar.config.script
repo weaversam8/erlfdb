@@ -237,10 +237,50 @@ DynamicLibrary = case IsArch("darwin") of
 end.
 DynamicLibraryDir = filename:dirname(DynamicLibrary).
 
+% Shell-quote a value safely for inclusion in a /bin/sh command. Wraps the
+% value in single quotes and escapes any embedded single quote with the
+% standard `'\''` trick. Allows paths containing spaces or other shell
+% metacharacters to round-trip cleanly through the pre_hooks shell string.
+ShellQuote = fun(Str) ->
+    Escaped = lists:flatten([
+        case C of
+            $' -> "'\\''";
+            _ -> [C]
+        end
+        || C <- Str
+    ]),
+    "'" ++ Escaped ++ "'"
+end.
+
+% Build the argument list passed to `make` for c_src/Makefile (worker
+% binary). Values are passed as Make arguments (VAR=value) rather than as
+% shell env-var prefix; this avoids relying on the hook being run through a
+% shell and works regardless of how rebar3 invokes the command. Each value
+% is shell-quoted so paths with spaces or shell metacharacters work
+% (rebar3's pre_hooks dispatch ultimately does pass through /bin/sh, but
+% the leading-VAR=val form trips its argv splitting).
+WorkerMakeArgs = lists:flatten([
+    " ERLFDB_INCLUDE_DIR=", ShellQuote(IncludeDir),
+    " ERLFDB_FDB_LIB_DIR=", ShellQuote(DynamicLibraryDir),
+    case is_integer(CompileAPIVersion) of
+        true -> " ERLFDB_FDB_API_VERSION=" ++ integer_to_list(CompileAPIVersion);
+        false -> ""
+    end
+]).
+
+WorkerMakeCmd  = "make -C c_src" ++ WorkerMakeArgs ++ " all".
+WorkerCleanCmd = "make -C c_src clean".
+
 [
     {erl_opts, ErlOpts ++ [
         {d, erlfdb_compile_time_api_version, CompileAPIVersion},
         {d, erlfdb_compile_time_external_client_library, DynamicLibrary}
+    ]},
+    {pre_hooks, [
+        {compile, WorkerMakeCmd}
+    ]},
+    {post_hooks, [
+        {clean, WorkerCleanCmd}
     ]},
     {port_env, [
         {
