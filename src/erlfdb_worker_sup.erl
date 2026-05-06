@@ -19,7 +19,9 @@
 
 -behaviour(supervisor).
 
--export([start_link/0, init/1, worker_count/0]).
+-export([start_link/0, init/1, worker_count/0, pick_worker/0]).
+
+-define(WORKER_TABLE, erlfdb_workers).
 
 -define(WORKER_COUNT_MAX_RATIO, 8).
 
@@ -27,6 +29,11 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
+    %% Named ETS table maps WorkerIx -> pid. Owned by this supervisor, so it
+    %% is automatically destroyed if the supervisor crashes and recreated fresh
+    %% when it restarts. Workers register themselves after their handshake
+    %% completes and overwrite on restart, so no explicit delete is needed.
+    ets:new(?WORKER_TABLE, [named_table, public, set, {read_concurrency, true}]),
     N = worker_count(),
     Schedulers = erlang:system_info(schedulers_online),
     MaxRatio =
@@ -58,6 +65,19 @@ init([]) ->
      || Ix <- lists:seq(1, N)
     ],
     {ok, {SupFlags, Children}}.
+
+%% Returns the pid of the worker assigned to the current scheduler. Distributes
+%% across N workers by mapping scheduler_id (1..schedulers_online) into the
+%% 1..N index range. If the entry is stale (worker crashed, not yet restarted),
+%% the caller will get a noproc error from gen_server:call - handled in later
+%% steps.
+pick_worker() ->
+    N = worker_count(),
+    Ix = ((erlang:system_info(scheduler_id) - 1) rem N) + 1,
+    case ets:lookup(?WORKER_TABLE, Ix) of
+        [{Ix, Pid}] -> Pid;
+        [] -> error(no_worker_available)
+    end.
 
 %% Resolves the configured worker count.
 %%

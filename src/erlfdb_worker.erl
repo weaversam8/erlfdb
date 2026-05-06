@@ -37,7 +37,9 @@
     port :: port(),
     os_pid :: integer(),
     %% Monotonic id used to correlate request/reply frames.
-    next_req_id = 1 :: pos_integer()
+    next_req_id = 1 :: pos_integer(),
+    %% Map of ReqId -> {gen_server From} for outstanding synchronous calls.
+    inflight = #{} :: #{pos_integer() => gen_server:from()}
 }).
 
 start_link(WorkerIx) when is_integer(WorkerIx), WorkerIx > 0 ->
@@ -64,6 +66,10 @@ init([WorkerIx]) ->
         {ok, OsPid} ->
             case run_init_handshake(Port, ?INIT_TIMEOUT_MS) of
                 ok ->
+                    %% Advertise this pid so erlfdb_port can route without
+                    %% consulting the supervisor. Overwrites any stale entry
+                    %% from a previous incarnation of this worker index.
+                    ets:insert(erlfdb_workers, {WorkerIx, self()}),
                     {ok, #state{
                         worker_ix = WorkerIx,
                         port = Port,
@@ -81,6 +87,12 @@ init([WorkerIx]) ->
 
 handle_call(os_pid, _From, State) ->
     {reply, State#state.os_pid, State};
+handle_call({request, Op, Args}, From, State) ->
+    ReqId = State#state.next_req_id,
+    Frame = term_to_binary({req, ReqId, Op, Args}),
+    true = port_command(State#state.port, Frame),
+    Inflight = maps:put(ReqId, From, State#state.inflight),
+    {noreply, State#state{next_req_id = ReqId + 1, inflight = Inflight}};
 handle_call(_Req, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -91,10 +103,25 @@ handle_info({Port, {exit_status, Status}}, #state{port = Port} = State) ->
     {stop, {worker_exited, Status}, State};
 handle_info({'EXIT', Port, Reason}, #state{port = Port} = State) ->
     {stop, {port_exit, Reason}, State};
-handle_info({Port, {data, _Bin}}, #state{port = Port} = State) ->
-    %% Step 2: no requests are flowing yet beyond the init handshake.
-    %% Step 3 will route incoming frames to inflight callers / future owners.
-    {noreply, State};
+handle_info({Port, {data, Bin}}, #state{port = Port} = State) ->
+    try binary_to_term(Bin) of
+        {reply, ReqId, Result} ->
+            case maps:take(ReqId, State#state.inflight) of
+                {From, Inflight} ->
+                    gen_server:reply(From, Result),
+                    {noreply, State#state{inflight = Inflight}};
+                error ->
+                    %% No caller waiting (e.g. the init handshake reply, which
+                    %% is consumed synchronously in wait_for_hello/run_init_handshake
+                    %% before the gen_server loop starts).
+                    {noreply, State}
+            end;
+        _Other ->
+            {noreply, State}
+    catch
+        error:_ ->
+            {noreply, State}
+    end;
 handle_info(_Other, State) ->
     {noreply, State}.
 

@@ -325,7 +325,7 @@ init_fdb_db(ClusterFile, Options) ->
     end.
 
 get_storage() ->
-    Vsn = erlfdb_nif:get_max_api_version(),
+    Vsn = erlfdb_port:get_max_api_version(),
     if
         Vsn >= 730 ->
             "ssd-redwood-1";

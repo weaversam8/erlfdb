@@ -41,10 +41,7 @@ endif
 
 CFLAGS_COMMON := -Wall -Werror -g -O2 -std=c11 $(COMMON_DEFINES)
 
-# libei + pthread are always required. libfdb_c will be added in step 4 when
-# the worker actually calls into it; the echo binary in step 1 doesn't need
-# it.
-LDFLAGS_LIBS := -lei -lpthread
+LDFLAGS_LIBS := -lei -lpthread -L"$(ERLFDB_FDB_LIB_DIR)" -lfdb_c
 
 ifeq ($(UNAME_S),Darwin)
 RPATH_SELF      := @loader_path

@@ -10,9 +10,9 @@
 // License for the specific language governing permissions and limitations under
 // the License.
 
-// Step 2 scaffold: emit a {hello, OsPid} frame on startup, then loop reading
-// {req, ReqId, Op, Args} frames and replying {reply, ReqId, ok} for any Op.
-// Step 3 will replace the trivial dispatcher with real op handling.
+// Step 3: emit {hello, OsPid} on startup; dispatch {req, ReqId, Op, Args}
+// frames to the appropriate handler, which replies {reply, ReqId, Result}.
+// Supported ops so far: init, get_max_api_version.
 //
 // {packet, 4} framing: each message is a 4-byte big-endian length prefix
 // followed by N bytes of ETF payload. The BEAM-side port option produces this
@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "fdb.h"
 
 static int read_exact(int fd, void *buf, size_t want) {
     uint8_t *p = (uint8_t *)buf;
@@ -117,8 +118,34 @@ static int send_reply_ok(long req_id) {
     return rc;
 }
 
-// Step 2 dispatcher: decode {req, ReqId, _Op, _Args}, reply {reply, ReqId,
-// ok} unconditionally. Step 3 introduces real op routing.
+static int send_reply_ok_long(long req_id, long value) {
+    ei_x_buff x;
+    if (ei_x_new_with_version(&x) != 0) return -1;
+    ei_x_encode_tuple_header(&x, 3);
+    ei_x_encode_atom(&x, "reply");
+    ei_x_encode_long(&x, req_id);
+    ei_x_encode_tuple_header(&x, 2);
+    ei_x_encode_atom(&x, "ok");
+    ei_x_encode_long(&x, value);
+    int rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+    ei_x_free(&x);
+    return rc;
+}
+
+static int send_reply_error(long req_id, const char *reason) {
+    ei_x_buff x;
+    if (ei_x_new_with_version(&x) != 0) return -1;
+    ei_x_encode_tuple_header(&x, 3);
+    ei_x_encode_atom(&x, "reply");
+    ei_x_encode_long(&x, req_id);
+    ei_x_encode_tuple_header(&x, 2);
+    ei_x_encode_atom(&x, "error");
+    ei_x_encode_atom(&x, reason);
+    int rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+    ei_x_free(&x);
+    return rc;
+}
+
 static int handle_request(const uint8_t *buf, uint32_t len) {
     (void)len;
     int idx = 0;
@@ -135,11 +162,16 @@ static int handle_request(const uint8_t *buf, uint32_t len) {
     long req_id = 0;
     if (ei_decode_long((const char *)buf, &idx, &req_id) != 0) return -1;
 
-    // Skip op atom and args; step 2 doesn't dispatch on them.
     char op[MAXATOMLEN + 1] = {0};
     if (ei_decode_atom((const char *)buf, &idx, op) != 0) return -1;
 
-    return send_reply_ok(req_id);
+    if (strcmp(op, "init") == 0) {
+        return send_reply_ok(req_id);
+    } else if (strcmp(op, "get_max_api_version") == 0) {
+        return send_reply_ok_long(req_id, (long)fdb_get_max_api_version());
+    }
+
+    return send_reply_error(req_id, "unknown_op");
 }
 
 int main(int argc, char **argv) {
