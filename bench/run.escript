@@ -50,14 +50,19 @@ main(Args) ->
 benchmarks(#{
     nif_db := NifDb,
     port_db := PortDb,
+    nif_tx := NifTx,
+    port_tx := PortTx,
     cluster_file := ClusterFile
 }) ->
     [
+        %% ----- Stateless / no-resource ops -----
         {
             "get_max_api_version",
             fun erlfdb_nif:get_max_api_version/0,
             fun erlfdb_port:get_max_api_version/0
         },
+
+        %% ----- Resource creation -----
         {
             "create_database",
             fun() -> erlfdb_nif:create_database(ClusterFile) end,
@@ -69,6 +74,43 @@ benchmarks(#{
             "database_create_transaction",
             fun() -> erlfdb_nif:database_create_transaction(NifDb) end,
             fun() -> erlfdb_port:database_create_transaction(PortDb) end
+        },
+
+        %% ----- Sync transaction ops (local, no network roundtrip) -----
+        %% All of these accumulate state on NifTx/PortTx but never commit, so
+        %% the FDB server is never contacted.  The comparison isolates IPC
+        %% overhead (port) vs in-process call overhead (NIF).
+
+        {
+            "transaction_set",
+            fun() -> erlfdb_nif:transaction_set(NifTx, <<"bench_key">>, <<"v">>) end,
+            fun() -> erlfdb_port:transaction_set(PortTx, <<"bench_key">>, <<"v">>) end
+        },
+        {
+            "transaction_clear",
+            fun() -> erlfdb_nif:transaction_clear(NifTx, <<"bench_key">>) end,
+            fun() -> erlfdb_port:transaction_clear(PortTx, <<"bench_key">>) end
+        },
+        {
+            "transaction_atomic_op (add)",
+            fun() -> erlfdb_nif:transaction_atomic_op(NifTx, <<"counter">>, 1, add) end,
+            fun() -> erlfdb_port:transaction_atomic_op(PortTx, <<"counter">>, 1, add) end
+        },
+        {
+            "transaction_is_read_only",
+            fun() -> erlfdb_nif:transaction_is_read_only(NifTx) end,
+            fun() -> erlfdb_port:transaction_is_read_only(PortTx) end
+        },
+        {
+            "transaction_get_next_tx_id",
+            fun() -> erlfdb_nif:transaction_get_next_tx_id(NifTx) end,
+            fun() -> erlfdb_port:transaction_get_next_tx_id(PortTx) end
+        },
+        {
+            %% Reset clears accumulated mutations; fine to run in a tight loop.
+            "transaction_reset",
+            fun() -> erlfdb_nif:transaction_reset(NifTx) end,
+            fun() -> erlfdb_port:transaction_reset(PortTx) end
         }
 
         %% Future examples (uncomment when the port ops are implemented):
@@ -120,6 +162,11 @@ setup_db() ->
     NifDb = erlfdb:open(ClusterFile),
     PortDb = erlfdb_port:create_database(ClusterFile),
 
+    %% Pre-created transactions for reuse across transaction-op benchmarks.
+    %% These are never committed so no mutations reach the FDB server.
+    NifTx = erlfdb_nif:database_create_transaction(NifDb),
+    PortTx = erlfdb_port:database_create_transaction(PortDb),
+
     io:format("Seeding ~p keys...~n", [?SEED_KEY_COUNT]),
     erlfdb:transactional(NifDb, fun(Tx) ->
         lists:foreach(
@@ -131,6 +178,8 @@ setup_db() ->
     #{
         nif_db => NifDb,
         port_db => PortDb,
+        nif_tx => NifTx,
+        port_tx => PortTx,
         cluster_file => ClusterFile
     }.
 

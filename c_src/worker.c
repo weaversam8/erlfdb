@@ -41,6 +41,20 @@
 #include "registry.h"
 
 // ---------------------------------------------------------------------------
+// Enhanced transaction struct — wraps FDBTransaction* with the local flags
+// the NIF tracked in ErlFDBTransaction (read_only, writes_allowed, has_watches,
+// txid). Stored in tx_registry instead of a raw FDBTransaction*.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    FDBTransaction *transaction;
+    uint32_t txid;
+    int read_only;      // starts 1; cleared to 0 on first write
+    int writes_allowed; // starts 1; cleared by disallow_writes option
+    int has_watches;    // set to 1 when a watch is registered
+} erlfdb_tx_t;
+
+// ---------------------------------------------------------------------------
 // Resource registries — one per FDB handle type
 // ---------------------------------------------------------------------------
 
@@ -62,8 +76,13 @@ static void fdb_database_destroy_cb(void *v) {
 static void fdb_tenant_destroy_cb(void *v) {
     if (v) fdb_tenant_destroy((FDBTenant *)v);
 }
-static void fdb_transaction_destroy_cb(void *v) {
-    if (v) fdb_transaction_destroy((FDBTransaction *)v);
+static void erlfdb_tx_destroy_cb(void *v) {
+    // v is void* here because erlfdb_registry_destroy takes a generic
+    // void (*)(void*) callback — see registry.h. Cast to the real type inside.
+    if (!v) return;
+    erlfdb_tx_t *t = (erlfdb_tx_t *)v;
+    if (t->transaction) fdb_transaction_destroy(t->transaction);
+    free(t);
 }
 static void fdb_future_destroy_cb(void *v) {
     if (v) fdb_future_destroy((FDBFuture *)v);
@@ -72,7 +91,7 @@ static void fdb_future_destroy_cb(void *v) {
 static void registries_destroy(void) {
     erlfdb_registry_destroy(&db_registry, fdb_database_destroy_cb);
     erlfdb_registry_destroy(&tenant_registry, fdb_tenant_destroy_cb);
-    erlfdb_registry_destroy(&tx_registry, fdb_transaction_destroy_cb);
+    erlfdb_registry_destroy(&tx_registry, erlfdb_tx_destroy_cb);
     erlfdb_registry_destroy(&future_registry, fdb_future_destroy_cb);
 }
 
@@ -463,12 +482,385 @@ static int dispatch_database_create_transaction(long req_id, const char *buf,
     fdb_error_t err = fdb_database_create_transaction(database, &transaction);
     if (err != 0) return send_reply_fdb_error(req_id, err);
 
-    if (erlfdb_registry_put(&tx_registry, &tx_ref, transaction, NULL) != 0) {
+    erlfdb_tx_t *tx = (erlfdb_tx_t *)malloc(sizeof(erlfdb_tx_t));
+    if (!tx) {
         fdb_transaction_destroy(transaction);
+        return -1;
+    }
+    tx->transaction  = transaction;
+    tx->txid         = 0;
+    tx->read_only    = 1;
+    tx->writes_allowed = 1;
+    tx->has_watches  = 0;
+
+    if (erlfdb_registry_put(&tx_registry, &tx_ref, tx, NULL) != 0) {
+        erlfdb_tx_destroy_cb(tx);
         return send_reply_error(req_id, "registry_alloc_failed");
     }
 
     return send_reply_ok(req_id);
+}
+
+// ---------------------------------------------------------------------------
+// Transaction option / mutation type / conflict type lookups
+// ---------------------------------------------------------------------------
+
+typedef struct { const char *name; FDBTransactionOption opt; } tx_option_entry;
+static const tx_option_entry tx_option_map[] = {
+    {"causal_write_risky",                   FDB_TR_OPTION_CAUSAL_WRITE_RISKY},
+    {"causal_read_risky",                    FDB_TR_OPTION_CAUSAL_READ_RISKY},
+    {"causal_read_disable",                  FDB_TR_OPTION_CAUSAL_READ_DISABLE},
+    {"include_port_in_address",              FDB_TR_OPTION_INCLUDE_PORT_IN_ADDRESS},
+    {"next_write_no_write_conflict_range",   FDB_TR_OPTION_NEXT_WRITE_NO_WRITE_CONFLICT_RANGE},
+    {"read_your_writes_disable",             FDB_TR_OPTION_READ_YOUR_WRITES_DISABLE},
+    {"read_ahead_disable",                   FDB_TR_OPTION_READ_AHEAD_DISABLE},
+    {"durability_datacenter",               FDB_TR_OPTION_DURABILITY_DATACENTER},
+    {"durability_risky",                     FDB_TR_OPTION_DURABILITY_RISKY},
+    {"durability_dev_null_is_web_scale",     FDB_TR_OPTION_DURABILITY_DEV_NULL_IS_WEB_SCALE},
+    {"priority_system_immediate",            FDB_TR_OPTION_PRIORITY_SYSTEM_IMMEDIATE},
+    {"priority_batch",                       FDB_TR_OPTION_PRIORITY_BATCH},
+    {"initialize_new_database",              FDB_TR_OPTION_INITIALIZE_NEW_DATABASE},
+    {"access_system_keys",                   FDB_TR_OPTION_ACCESS_SYSTEM_KEYS},
+    {"read_system_keys",                     FDB_TR_OPTION_READ_SYSTEM_KEYS},
+    {"debug_retry_logging",                  FDB_TR_OPTION_DEBUG_RETRY_LOGGING},
+    {"transaction_logging_enable",           FDB_TR_OPTION_TRANSACTION_LOGGING_ENABLE},
+    {"debug_transaction_identifier",         FDB_TR_OPTION_DEBUG_TRANSACTION_IDENTIFIER},
+    {"log_transaction",                      FDB_TR_OPTION_LOG_TRANSACTION},
+    {"transaction_logging_max_field_length", FDB_TR_OPTION_TRANSACTION_LOGGING_MAX_FIELD_LENGTH},
+    {"timeout",                              FDB_TR_OPTION_TIMEOUT},
+    {"retry_limit",                          FDB_TR_OPTION_RETRY_LIMIT},
+    {"max_retry_delay",                      FDB_TR_OPTION_MAX_RETRY_DELAY},
+    {"size_limit",                           FDB_TR_OPTION_SIZE_LIMIT},
+    {"snapshot_ryw_enable",                  FDB_TR_OPTION_SNAPSHOT_RYW_ENABLE},
+    {"snapshot_ryw_disable",                 FDB_TR_OPTION_SNAPSHOT_RYW_DISABLE},
+    {"lock_aware",                           FDB_TR_OPTION_LOCK_AWARE},
+    {"used_during_commit_protection_disable",FDB_TR_OPTION_USED_DURING_COMMIT_PROTECTION_DISABLE},
+    {"read_lock_aware",                      FDB_TR_OPTION_READ_LOCK_AWARE},
+    {"use_provisional_proxies",              FDB_TR_OPTION_USE_PROVISIONAL_PROXIES},
+#if FDB_API_VERSION > 620
+    {"report_conflicting_keys",              FDB_TR_OPTION_REPORT_CONFLICTING_KEYS},
+#endif
+#if FDB_API_VERSION > 630
+    {"special_key_space_enable_writes",      FDB_TR_OPTION_SPECIAL_KEY_SPACE_ENABLE_WRITES},
+#endif
+};
+static int lookup_tx_option(const char *name, FDBTransactionOption *out) {
+    size_t n = sizeof(tx_option_map) / sizeof(tx_option_map[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(name, tx_option_map[i].name) == 0) {
+            *out = tx_option_map[i].opt;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+typedef struct { const char *name; FDBMutationType mtype; } mutation_entry;
+static const mutation_entry mutation_map[] = {
+    {"add",                      FDB_MUTATION_TYPE_ADD},
+    {"bit_and",                  FDB_MUTATION_TYPE_BIT_AND},
+    {"bit_or",                   FDB_MUTATION_TYPE_BIT_OR},
+    {"bit_xor",                  FDB_MUTATION_TYPE_BIT_XOR},
+    {"append_if_fits",           FDB_MUTATION_TYPE_APPEND_IF_FITS},
+    {"max",                      FDB_MUTATION_TYPE_MAX},
+    {"min",                      FDB_MUTATION_TYPE_MIN},
+    {"byte_min",                 FDB_MUTATION_TYPE_BYTE_MIN},
+    {"byte_max",                 FDB_MUTATION_TYPE_BYTE_MAX},
+    {"set_versionstamped_key",   FDB_MUTATION_TYPE_SET_VERSIONSTAMPED_KEY},
+    {"set_versionstamped_value", FDB_MUTATION_TYPE_SET_VERSIONSTAMPED_VALUE},
+};
+static int lookup_mutation_type(const char *name, FDBMutationType *out) {
+    size_t n = sizeof(mutation_map) / sizeof(mutation_map[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(name, mutation_map[i].name) == 0) { *out = mutation_map[i].mtype; return 1; }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// decode_tx: decode a TxRef from buf at *idx and look up the transaction.
+// On success returns 0 and sets *out. On error sends a reply and returns
+// either 0 (error reply sent cleanly) or -1 (fatal write failure).
+// Callers distinguish by checking *out == NULL for the logical-error case.
+// ---------------------------------------------------------------------------
+
+static int decode_tx(const char *buf, int *idx, long req_id, erlfdb_tx_t **out) {
+    *out = NULL;
+    erlang_ref tx_ref;
+    if (ei_decode_ref(buf, idx, &tx_ref) != 0)
+        return send_reply_error(req_id, "bad_tx_ref");
+    *out = (erlfdb_tx_t *)erlfdb_registry_get(&tx_registry, &tx_ref);
+    if (!*out)
+        return send_reply_error(req_id, "unknown_tx");
+    return 0;
+}
+
+// Helper: decode a binary value at *idx. Caller frees *valout.
+static int decode_binary(const char *buf, int *idx, long req_id,
+                         uint8_t **valout, int *lenout) {
+    int type = 0, bin_size = 0;
+    if (ei_get_type(buf, idx, &type, &bin_size) != 0)
+        return send_reply_error(req_id, "bad_binary_type");
+    *valout = (uint8_t *)malloc((size_t)(bin_size > 0 ? bin_size : 1));
+    if (!*valout) return -1;
+    long actual = (long)bin_size;
+    if (ei_decode_binary(buf, idx, *valout, &actual) != 0) {
+        free(*valout); *valout = NULL;
+        return send_reply_error(req_id, "bad_binary");
+    }
+    *lenout = bin_size;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Sync transaction dispatchers
+// ---------------------------------------------------------------------------
+
+static int dispatch_transaction_set(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 3)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *key = NULL, *val = NULL;
+    int klen = 0, vlen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &key, &klen)) != 0) return r;
+    if ((r = decode_binary(buf, idx, req_id, &val, &vlen)) != 0) { free(key); return r; }
+    fdb_transaction_set(tx->transaction, key, klen, val, vlen);
+    free(key); free(val);
+    tx->read_only = 0;
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_transaction_clear(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 2)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *key = NULL; int klen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &key, &klen)) != 0) return r;
+    fdb_transaction_clear(tx->transaction, key, klen);
+    free(key);
+    tx->read_only = 0;
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_transaction_clear_range(long req_id, const char *buf,
+                                            int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 3)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *skey = NULL, *ekey = NULL; int slen = 0, elen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &skey, &slen)) != 0) return r;
+    if ((r = decode_binary(buf, idx, req_id, &ekey, &elen)) != 0) { free(skey); return r; }
+    fdb_transaction_clear_range(tx->transaction, skey, slen, ekey, elen);
+    free(skey); free(ekey);
+    tx->read_only = 0;
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_transaction_atomic_op(long req_id, const char *buf,
+                                          int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 4)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *key = NULL, *param = NULL; int klen = 0, plen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &key, &klen)) != 0) return r;
+    if ((r = decode_binary(buf, idx, req_id, &param, &plen)) != 0) { free(key); return r; }
+    char mtype_name[MAXATOMLEN + 1] = {0};
+    if (ei_decode_atom(buf, idx, mtype_name) != 0) {
+        free(key); free(param);
+        return send_reply_error(req_id, "bad_mutation_type");
+    }
+    FDBMutationType mtype;
+    if (!lookup_mutation_type(mtype_name, &mtype)) {
+        free(key); free(param);
+        return send_reply_error(req_id, "unknown_mutation_type");
+    }
+    fdb_transaction_atomic_op(tx->transaction, key, klen, param, plen, mtype);
+    free(key); free(param);
+    tx->read_only = 0;
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_transaction_set_option(long req_id, const char *buf,
+                                           int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 3)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    char opt_name[MAXATOMLEN + 1] = {0};
+    if (ei_decode_atom(buf, idx, opt_name) != 0)
+        return send_reply_error(req_id, "bad_option_name");
+    // allow_writes and disallow_writes are local flags, not passed to FDB.
+    if (strcmp(opt_name, "allow_writes") == 0) {
+        tx->writes_allowed = 1;
+        // Consume the (empty) value binary that the Erlang side always sends.
+        uint8_t *val = NULL; int vlen = 0;
+        decode_binary(buf, idx, req_id, &val, &vlen); free(val);
+        return send_reply_ok(req_id);
+    }
+    if (strcmp(opt_name, "disallow_writes") == 0) {
+        if (!tx->read_only) return send_reply_error(req_id, "writes_already_done");
+        tx->writes_allowed = 0;
+        uint8_t *val = NULL; int vlen = 0;
+        decode_binary(buf, idx, req_id, &val, &vlen); free(val);
+        return send_reply_ok(req_id);
+    }
+    uint8_t *val = NULL; int vlen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &val, &vlen)) != 0) return r;
+    FDBTransactionOption fdb_opt;
+    if (lookup_tx_option(opt_name, &fdb_opt)) {
+        fdb_error_t err = fdb_transaction_set_option(tx->transaction, fdb_opt,
+                                                      val, vlen);
+        free(val);
+        if (err != 0) return send_reply_fdb_error(req_id, err);
+    } else {
+        free(val); // unknown options silently ignored (forward compatibility)
+    }
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_transaction_set_read_version(long req_id, const char *buf,
+                                                 int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 2)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    long version = 0;
+    if (ei_decode_long(buf, idx, &version) != 0)
+        return send_reply_error(req_id, "bad_version");
+    fdb_transaction_set_read_version(tx->transaction, (int64_t)version);
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_transaction_reset(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    fdb_transaction_reset(tx->transaction);
+    tx->txid      = 0;
+    tx->read_only = 1;
+    tx->has_watches = 0;
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_transaction_cancel(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    fdb_transaction_cancel(tx->transaction);
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_transaction_add_conflict_range(long req_id, const char *buf,
+                                                   int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 4)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *skey = NULL, *ekey = NULL; int slen = 0, elen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &skey, &slen)) != 0) return r;
+    if ((r = decode_binary(buf, idx, req_id, &ekey, &elen)) != 0) { free(skey); return r; }
+    char rtype_name[MAXATOMLEN + 1] = {0};
+    if (ei_decode_atom(buf, idx, rtype_name) != 0) {
+        free(skey); free(ekey);
+        return send_reply_error(req_id, "bad_conflict_type");
+    }
+    FDBConflictRangeType rtype;
+    if (strcmp(rtype_name, "read") == 0) rtype = FDB_CONFLICT_RANGE_TYPE_READ;
+    else if (strcmp(rtype_name, "write") == 0) rtype = FDB_CONFLICT_RANGE_TYPE_WRITE;
+    else { free(skey); free(ekey); return send_reply_error(req_id, "unknown_conflict_type"); }
+    fdb_error_t err = fdb_transaction_add_conflict_range(tx->transaction,
+                                                          skey, slen,
+                                                          ekey, elen, rtype);
+    free(skey); free(ekey);
+    if (err != 0) return send_reply_fdb_error(req_id, err);
+    if (rtype == FDB_CONFLICT_RANGE_TYPE_WRITE) tx->read_only = 0;
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_transaction_get_committed_version(long req_id,
+                                                      const char *buf,
+                                                      int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    int64_t version = 0;
+    fdb_error_t err = fdb_transaction_get_committed_version(tx->transaction,
+                                                             &version);
+    if (err != 0) return send_reply_fdb_error(req_id, err);
+    return send_reply_ok_long(req_id, (long)version);
+}
+
+static int dispatch_transaction_get_next_tx_id(long req_id, const char *buf,
+                                               int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    if (tx->txid > 65535) return send_reply_error(req_id, "txid_overflow");
+    uint32_t id = tx->txid++;
+    return send_reply_ok_long(req_id, (long)id);
+}
+
+static int dispatch_transaction_is_read_only(long req_id, const char *buf,
+                                             int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    return send_reply_ok_long(req_id, (long)tx->read_only);
+}
+
+static int dispatch_transaction_has_watches(long req_id, const char *buf,
+                                            int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    return send_reply_ok_long(req_id, (long)tx->has_watches);
+}
+
+static int dispatch_transaction_get_writes_allowed(long req_id, const char *buf,
+                                                   int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    return send_reply_ok_long(req_id, (long)tx->writes_allowed);
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +895,34 @@ static int handle_request(const uint8_t *buf, uint32_t len) {
         return dispatch_create_database(req_id, (const char *)buf, &idx);
     } else if (strcmp(op, "database_create_transaction") == 0) {
         return dispatch_database_create_transaction(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_set") == 0) {
+        return dispatch_transaction_set(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_clear") == 0) {
+        return dispatch_transaction_clear(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_clear_range") == 0) {
+        return dispatch_transaction_clear_range(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_atomic_op") == 0) {
+        return dispatch_transaction_atomic_op(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_set_option") == 0) {
+        return dispatch_transaction_set_option(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_set_read_version") == 0) {
+        return dispatch_transaction_set_read_version(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_reset") == 0) {
+        return dispatch_transaction_reset(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_cancel") == 0) {
+        return dispatch_transaction_cancel(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_add_conflict_range") == 0) {
+        return dispatch_transaction_add_conflict_range(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_committed_version") == 0) {
+        return dispatch_transaction_get_committed_version(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_next_tx_id") == 0) {
+        return dispatch_transaction_get_next_tx_id(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_is_read_only") == 0) {
+        return dispatch_transaction_is_read_only(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_has_watches") == 0) {
+        return dispatch_transaction_has_watches(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_writes_allowed") == 0) {
+        return dispatch_transaction_get_writes_allowed(req_id, (const char *)buf, &idx);
     }
 
     return send_reply_error(req_id, "unknown_op");
