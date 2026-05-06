@@ -15,10 +15,18 @@
     {vsn, "1.2.0"},
     {registered, []},
     {applications, [kernel, stdlib]},
+    {mod, {erlfdb_app, []}},
     {maintainers, ["Jesse Stimpson"]},
     {links, [{"GitHub", "https://github.com/foundationdb-beam/erlfdb"}]},
     {licenses, ["Apache-2.0"]},
     {env, [
-        {network_options, []}
+        {network_options, []},
+        %% Number of worker subprocesses to spawn. Allowed values: a positive
+        %% integer; the atom `schedulers_online` (default); or an `{M, F, A}`
+        %% tuple that returns a positive integer.
+        {worker_count, schedulers_online},
+        %% Cap on worker_count expressed as a multiple of schedulers_online.
+        %% Refuses to start if the resolved worker_count exceeds this ratio.
+        {worker_count_max_ratio, 8}
     ]}
 ]}.
