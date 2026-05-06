@@ -27,6 +27,10 @@
     get_max_api_version/0,
     create_database/1,
     database_create_transaction/1,
+    transaction_get/3,
+    transaction_commit/1,
+    future_get/1,
+    wait/1,
     transaction_set_option/2,
     transaction_set_option/3,
     transaction_set_read_version/2,
@@ -81,6 +85,44 @@ database_create_transaction({erlfdb_database, Worker, DbRef}) ->
             erlang:error({erlfdb_error, Code});
         {error, Reason} ->
             erlang:error({erlfdb_error, Reason})
+    end.
+
+%% Async read — registers a future; BEAM receives {ready,...} when the FDB
+%% network delivers the result, then calls future_get/1 to retrieve it.
+transaction_get({erlfdb_transaction, Worker, TxRef}, Key, Snapshot) ->
+    FutRef = make_ref(),
+    Args = {TxRef, Key, Snapshot, FutRef, self()},
+    case gen_server:call(Worker, {request, transaction_get, Args}) of
+        ok -> {erlfdb_future, Worker, FutRef};
+        {error, Code} when is_integer(Code) -> erlang:error({erlfdb_error, Code});
+        {error, Reason} -> erlang:error({erlfdb_error, Reason})
+    end.
+
+%% Async commit — same future pattern as transaction_get.
+transaction_commit({erlfdb_transaction, Worker, TxRef}) ->
+    FutRef = make_ref(),
+    Args = {TxRef, FutRef, self()},
+    case gen_server:call(Worker, {request, transaction_commit, Args}) of
+        ok -> {erlfdb_future, Worker, FutRef};
+        {error, Code} when is_integer(Code) -> erlang:error({erlfdb_error, Code});
+        {error, Reason} -> erlang:error({erlfdb_error, Reason})
+    end.
+
+%% Retrieve the result of a ready future.  Only call after receiving {FutRef, ready}.
+future_get({erlfdb_future, Worker, FutRef}) ->
+    case gen_server:call(Worker, {request, future_get, {FutRef}}) of
+        {ok, Value}  -> Value;
+        not_found    -> not_found;
+        ok           -> ok;
+        {error, Code} when is_integer(Code) -> erlang:error({erlfdb_error, Code});
+        {error, Reason} -> erlang:error({erlfdb_error, Reason})
+    end.
+
+%% Block until a future is ready then return its result.
+wait({erlfdb_future, _Worker, FutRef} = Future) ->
+    receive
+        {FutRef, ready}        -> future_get(Future);
+        {{_TxRef, FutRef}, ready} -> future_get(Future)
     end.
 
 transaction_set_option(Tx, Option) ->

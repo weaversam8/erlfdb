@@ -111,6 +111,37 @@ benchmarks(#{
             "transaction_reset",
             fun() -> erlfdb_nif:transaction_reset(NifTx) end,
             fun() -> erlfdb_port:transaction_reset(PortTx) end
+        },
+
+        %% ----- Async ops with real FDB network roundtrips -----
+        %% These benchmarks create a new transaction per iteration so the
+        %% numbers include create_transaction overhead, which is small (~1 us
+        %% NIF / ~13 us port).  The dominant cost is FDB network latency.
+
+        {
+            "transaction_commit (set one key + commit)",
+            fun() ->
+                Tx = erlfdb_nif:database_create_transaction(NifDb),
+                erlfdb_nif:transaction_set(Tx, bench_key(1), bench_val(1)),
+                erlfdb:wait(erlfdb_nif:transaction_commit(Tx))
+            end,
+            fun() ->
+                Tx = erlfdb_port:database_create_transaction(PortDb),
+                erlfdb_port:transaction_set(Tx, bench_key(1), bench_val(1)),
+                erlfdb_port:wait(erlfdb_port:transaction_commit(Tx))
+            end
+        },
+        {
+            "transaction_get (snapshot read, hot key)",
+            fun() ->
+                Tx = erlfdb_nif:database_create_transaction(NifDb),
+                erlfdb:wait(erlfdb_nif:transaction_get(Tx, bench_key(1), true))
+            end,
+            fun() ->
+                Tx = erlfdb_port:database_create_transaction(PortDb),
+                erlfdb_port:wait(
+                    erlfdb_port:transaction_get(Tx, bench_key(1), true))
+            end
         }
 
         %% Future examples (uncomment when the port ops are implemented):

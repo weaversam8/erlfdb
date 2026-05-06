@@ -38,7 +38,34 @@
 #define FDB_API_VERSION 0
 #endif
 #include "fdb.h"
+#include "notify.h"
 #include "registry.h"
+#include <poll.h>
+
+// ---------------------------------------------------------------------------
+// Future type tag — determines which fdb_future_get_* function to call
+// ---------------------------------------------------------------------------
+
+typedef enum {
+    ERLFDB_FUT_VOID  = 0,
+    ERLFDB_FUT_VALUE,       // fdb_future_get_value  (transaction_get)
+    ERLFDB_FUT_INT64,       // fdb_future_get_int64  (get_read_version, etc.)
+    ERLFDB_FUT_KEY,         // fdb_future_get_key
+    ERLFDB_FUT_STRING_ARRAY,
+    ERLFDB_FUT_KEYVALUE_ARRAY,
+    ERLFDB_FUT_MAPPEDKEYVALUE_ARRAY,
+    ERLFDB_FUT_KEY_ARRAY,
+} erlfdb_future_type;
+
+// Enhanced future struct.  Stored in future_registry; freed after future_get.
+typedef struct {
+    FDBFuture *future;
+    erlfdb_future_type ftype;
+    erlang_ref fut_ref;    // the Erlang ref — used in the {ready,...} notification
+    erlang_pid owner_pid;  // the Erlang process to notify when ready
+    int tx_scoped;         // 1 → include tx_ref in notification
+    erlang_ref tx_ref;     // the transaction ref for tx-scoped notifications
+} erlfdb_future_t;
 
 // ---------------------------------------------------------------------------
 // Enhanced transaction struct — wraps FDBTransaction* with the local flags
@@ -84,15 +111,65 @@ static void erlfdb_tx_destroy_cb(void *v) {
     if (t->transaction) fdb_transaction_destroy(t->transaction);
     free(t);
 }
-static void fdb_future_destroy_cb(void *v) {
-    if (v) fdb_future_destroy((FDBFuture *)v);
+static void erlfdb_future_destroy_cb(void *v) {
+    if (!v) return;
+    erlfdb_future_t *ft = (erlfdb_future_t *)v;
+    if (ft->future) fdb_future_destroy(ft->future);
+    free(ft);
 }
 
 static void registries_destroy(void) {
     erlfdb_registry_destroy(&db_registry, fdb_database_destroy_cb);
     erlfdb_registry_destroy(&tenant_registry, fdb_tenant_destroy_cb);
     erlfdb_registry_destroy(&tx_registry, erlfdb_tx_destroy_cb);
-    erlfdb_registry_destroy(&future_registry, fdb_future_destroy_cb);
+    erlfdb_registry_destroy(&future_registry, erlfdb_future_destroy_cb);
+}
+
+// ---------------------------------------------------------------------------
+// Global notify queue — FDB network thread enqueues; main thread drains
+// ---------------------------------------------------------------------------
+
+static erlfdb_notify_queue g_notify_queue;
+
+// Forward declaration for write_frame defined in the I/O helpers section.
+static int write_frame(const uint8_t *buf, uint32_t len);
+
+// Registered with every async FDB future via fdb_future_set_callback.
+// Runs on the FDB network thread.
+static void fdb_future_completion_cb(FDBFuture *future, void *user_data) {
+    (void)future;
+    erlfdb_future_t *ft = (erlfdb_future_t *)user_data;
+    erlfdb_notify_signal(&g_notify_queue, &ft->fut_ref);
+}
+
+// Called from the main thread for each notification dequeued from the pipe.
+// Looks up the future and sends the appropriate {ready,...} frame to BEAM.
+static void send_ready(const erlang_pid *pid, int tx_scoped,
+                       const erlang_ref *tx_ref, const erlang_ref *fut_ref) {
+    ei_x_buff x;
+    if (ei_x_new_with_version(&x) != 0) return;
+    if (tx_scoped) {
+        ei_x_encode_tuple_header(&x, 4);
+        ei_x_encode_atom(&x, "ready");
+        ei_x_encode_pid(&x, pid);
+        ei_x_encode_ref(&x, tx_ref);
+        ei_x_encode_ref(&x, fut_ref);
+    } else {
+        ei_x_encode_tuple_header(&x, 3);
+        ei_x_encode_atom(&x, "ready");
+        ei_x_encode_pid(&x, pid);
+        ei_x_encode_ref(&x, fut_ref);
+    }
+    write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+    ei_x_free(&x);
+}
+
+static void process_notification(const erlang_ref *fut_ref, void *ctx) {
+    (void)ctx;
+    erlfdb_future_t *ft =
+        (erlfdb_future_t *)erlfdb_registry_get(&future_registry, fut_ref);
+    if (!ft) return; // future already freed (e.g. cancel) — ignore
+    send_ready(&ft->owner_pid, ft->tx_scoped, &ft->tx_ref, &ft->fut_ref);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +295,32 @@ static int send_reply_ok_long(long req_id, long value) {
     ei_x_encode_tuple_header(&x, 2);
     ei_x_encode_atom(&x, "ok");
     ei_x_encode_long(&x, value);
+    int rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+    ei_x_free(&x);
+    return rc;
+}
+
+static int send_reply_ok_binary(long req_id, const uint8_t *data, int len) {
+    ei_x_buff x;
+    if (ei_x_new_with_version(&x) != 0) return -1;
+    ei_x_encode_tuple_header(&x, 3);
+    ei_x_encode_atom(&x, "reply");
+    ei_x_encode_long(&x, req_id);
+    ei_x_encode_tuple_header(&x, 2);
+    ei_x_encode_atom(&x, "ok");
+    ei_x_encode_binary(&x, data, len);
+    int rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+    ei_x_free(&x);
+    return rc;
+}
+
+static int send_reply_not_found(long req_id) {
+    ei_x_buff x;
+    if (ei_x_new_with_version(&x) != 0) return -1;
+    ei_x_encode_tuple_header(&x, 3);
+    ei_x_encode_atom(&x, "reply");
+    ei_x_encode_long(&x, req_id);
+    ei_x_encode_atom(&x, "not_found");
     int rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
     ei_x_free(&x);
     return rc;
@@ -405,6 +508,7 @@ static int dispatch_init(long req_id, const char *buf, int *idx) {
 
     g_network_running = 1;
     registries_init();
+    erlfdb_notify_init(&g_notify_queue);
     return send_reply_ok(req_id);
 }
 
@@ -499,6 +603,162 @@ static int dispatch_database_create_transaction(long req_id, const char *buf,
     }
 
     return send_reply_ok(req_id);
+}
+
+// ---------------------------------------------------------------------------
+// Async dispatch helpers: register a future and set its FDB callback
+// ---------------------------------------------------------------------------
+
+// Forward declarations for decode helpers defined in the sync-ops section.
+static int decode_tx(const char *buf, int *idx, long req_id,
+                     erlfdb_tx_t **out);
+static int decode_binary(const char *buf, int *idx, long req_id,
+                         uint8_t **valout, int *lenout);
+
+static int register_future(long req_id, FDBFuture *future,
+                            erlfdb_future_type ftype,
+                            const erlang_ref *fut_ref,
+                            const erlang_pid *owner_pid,
+                            int tx_scoped,
+                            const erlang_ref *tx_ref) {
+    erlfdb_future_t *ft = (erlfdb_future_t *)malloc(sizeof(erlfdb_future_t));
+    if (!ft) {
+        fdb_future_destroy(future);
+        return -1;
+    }
+    ft->future     = future;
+    ft->ftype      = ftype;
+    ft->fut_ref    = *fut_ref;
+    ft->owner_pid  = *owner_pid;
+    ft->tx_scoped  = tx_scoped;
+    if (tx_scoped && tx_ref) ft->tx_ref = *tx_ref;
+
+    if (erlfdb_registry_put(&future_registry, fut_ref, ft, NULL) != 0) {
+        erlfdb_future_destroy_cb(ft);
+        return send_reply_error(req_id, "registry_alloc_failed");
+    }
+    fdb_future_set_callback(future, fdb_future_completion_cb, ft);
+    return send_reply_ok(req_id);
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch: transaction_get
+// Args: {TxRef, Key, Snapshot, FutRef, OwnerPid}
+// ---------------------------------------------------------------------------
+
+static int dispatch_transaction_get(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 5)
+        return send_reply_error(req_id, "bad_args");
+
+    erlang_ref tx_ref;
+    if (ei_decode_ref(buf, idx, &tx_ref) != 0)
+        return send_reply_error(req_id, "bad_tx_ref");
+    erlfdb_tx_t *tx =
+        (erlfdb_tx_t *)erlfdb_registry_get(&tx_registry, &tx_ref);
+    if (!tx) return send_reply_error(req_id, "unknown_tx");
+
+    uint8_t *key = NULL; int klen = 0;
+    int r;
+    if ((r = decode_binary(buf, idx, req_id, &key, &klen)) != 0) return r;
+
+    char snap_atom[MAXATOMLEN + 1] = {0};
+    if (ei_decode_atom(buf, idx, snap_atom) != 0) {
+        free(key);
+        return send_reply_error(req_id, "bad_snapshot");
+    }
+    int snapshot = strcmp(snap_atom, "true") == 0;
+
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0) {
+        free(key); return send_reply_error(req_id, "bad_fut_ref");
+    }
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0) {
+        free(key); return send_reply_error(req_id, "bad_owner_pid");
+    }
+
+    FDBFuture *future =
+        fdb_transaction_get(tx->transaction, key, klen, snapshot);
+    free(key);
+
+    return register_future(req_id, future, ERLFDB_FUT_VALUE,
+                           &fut_ref, &owner_pid, 1, &tx_ref);
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch: transaction_commit
+// Args: {TxRef, FutRef, OwnerPid}
+// ---------------------------------------------------------------------------
+
+static int dispatch_transaction_commit(long req_id, const char *buf,
+                                       int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 3)
+        return send_reply_error(req_id, "bad_args");
+
+    erlang_ref tx_ref;
+    if (ei_decode_ref(buf, idx, &tx_ref) != 0)
+        return send_reply_error(req_id, "bad_tx_ref");
+    erlfdb_tx_t *tx =
+        (erlfdb_tx_t *)erlfdb_registry_get(&tx_registry, &tx_ref);
+    if (!tx) return send_reply_error(req_id, "unknown_tx");
+
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0)
+        return send_reply_error(req_id, "bad_owner_pid");
+
+    FDBFuture *future = fdb_transaction_commit(tx->transaction);
+    return register_future(req_id, future, ERLFDB_FUT_VOID,
+                           &fut_ref, &owner_pid, 1, &tx_ref);
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch: future_get
+// Args: {FutRef}
+// Removes and frees the future entry after extracting the result.
+// ---------------------------------------------------------------------------
+
+static int dispatch_future_get(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+
+    erlfdb_future_t *ft = (erlfdb_future_t *)erlfdb_registry_remove(
+        &future_registry, &fut_ref);
+    if (!ft) return send_reply_error(req_id, "unknown_future");
+
+    int rc = 0;
+    switch (ft->ftype) {
+        case ERLFDB_FUT_VOID: {
+            fdb_error_t err = fdb_future_get_error(ft->future);
+            rc = (err != 0) ? send_reply_fdb_error(req_id, err)
+                            : send_reply_ok(req_id);
+            break;
+        }
+        case ERLFDB_FUT_VALUE: {
+            fdb_bool_t present = 0;
+            const uint8_t *val = NULL;
+            int len = 0;
+            fdb_error_t err =
+                fdb_future_get_value(ft->future, &present, &val, &len);
+            if (err != 0) rc = send_reply_fdb_error(req_id, err);
+            else if (!present) rc = send_reply_not_found(req_id);
+            else rc = send_reply_ok_binary(req_id, val, len);
+            break;
+        }
+        default:
+            rc = send_reply_error(req_id, "unsupported_future_type");
+    }
+    erlfdb_future_destroy_cb(ft);
+    return rc;
 }
 
 // ---------------------------------------------------------------------------
@@ -923,6 +1183,12 @@ static int handle_request(const uint8_t *buf, uint32_t len) {
         return dispatch_transaction_has_watches(req_id, (const char *)buf, &idx);
     } else if (strcmp(op, "transaction_get_writes_allowed") == 0) {
         return dispatch_transaction_get_writes_allowed(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get") == 0) {
+        return dispatch_transaction_get(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_commit") == 0) {
+        return dispatch_transaction_commit(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "future_get") == 0) {
+        return dispatch_future_get(req_id, (const char *)buf, &idx);
     }
 
     return send_reply_error(req_id, "unknown_op");
@@ -939,24 +1205,51 @@ int main(int argc, char **argv) {
     if (send_hello() != 0) return 1;
 
     for (;;) {
-        uint8_t *frame = NULL;
-        uint32_t flen = 0;
-        int r = read_frame(&frame, &flen);
-        if (r == 0) {
-            // EOF: BEAM closed the port (clean shutdown or hard crash).
-            // Destroy all live FDB resources, stop the network, join the
-            // thread so libfdb_c can flush in-flight work.
-            if (g_network_running) {
-                registries_destroy();
-                fdb_stop_network();
-                pthread_join(g_network_tid, NULL);
-            }
-            return 0;
+        // Poll stdin (always) and the notify pipe (once the network is up).
+        struct pollfd pfd[2];
+        pfd[0].fd      = STDIN_FILENO;
+        pfd[0].events  = POLLIN;
+        pfd[0].revents = 0;
+        int nfds = 1;
+        if (g_network_running) {
+            pfd[1].fd      = erlfdb_notify_rfd(&g_notify_queue);
+            pfd[1].events  = POLLIN;
+            pfd[1].revents = 0;
+            nfds = 2;
         }
-        if (r < 0) return 1;
 
-        int rc = handle_request(frame, flen);
-        free(frame);
-        if (rc != 0) return 1;
+        int n = poll(pfd, nfds, -1);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return 1;
+        }
+
+        // Process future-ready notifications before new requests to minimise
+        // the time between a future completing and BEAM receiving {ready,...}.
+        if (nfds == 2 && (pfd[1].revents & POLLIN)) {
+            erlfdb_notify_drain(&g_notify_queue, process_notification, NULL);
+        }
+
+        // Handle stdin: new request from BEAM, or EOF on port close / crash.
+        if (pfd[0].revents & (POLLIN | POLLHUP)) {
+            uint8_t *frame = NULL;
+            uint32_t flen  = 0;
+            int r = read_frame(&frame, &flen);
+            if (r == 0) {
+                // EOF: port closed (clean shutdown or hard crash).
+                if (g_network_running) {
+                    registries_destroy();
+                    erlfdb_notify_destroy(&g_notify_queue);
+                    fdb_stop_network();
+                    pthread_join(g_network_tid, NULL);
+                }
+                return 0;
+            }
+            if (r < 0) return 1;
+
+            int rc = handle_request(frame, flen);
+            free(frame);
+            if (rc != 0) return 1;
+        }
     }
 }

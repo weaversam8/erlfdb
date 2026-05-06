@@ -116,11 +116,18 @@ handle_info({Port, {data, Bin}}, #state{port = Port} = State) ->
                     gen_server:reply(From, Result),
                     {noreply, State#state{inflight = Inflight}};
                 error ->
-                    %% No caller waiting (e.g. the init handshake reply, which
-                    %% is consumed synchronously in wait_for_hello/run_init_handshake
-                    %% before the gen_server loop starts).
+                    %% No caller waiting (e.g. the init handshake reply consumed
+                    %% synchronously before the gen_server loop starts).
                     {noreply, State}
             end;
+        %% Unsolicited future-ready notifications from the worker subprocess.
+        %% Forward to the owner process so its erlfdb_port:wait/1 unblocks.
+        {ready, OwnerPid, FutRef} ->
+            OwnerPid ! {FutRef, ready},
+            {noreply, State};
+        {ready, OwnerPid, TxRef, FutRef} ->
+            OwnerPid ! {{TxRef, FutRef}, ready},
+            {noreply, State};
         _Other ->
             {noreply, State}
     catch
