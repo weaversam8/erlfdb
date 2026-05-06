@@ -24,7 +24,9 @@
 -endif.
 
 -export([
-    get_max_api_version/0
+    get_max_api_version/0,
+    create_database/1,
+    database_create_transaction/1
 ]).
 
 -spec get_max_api_version() -> integer().
@@ -34,6 +36,34 @@ get_max_api_version() ->
     case gen_server:call(Worker, {request, get_max_api_version, {}}) of
         {ok, Vsn} when is_integer(Vsn) ->
             Vsn;
+        {error, Reason} ->
+            erlang:error({erlfdb_error, Reason})
+    end.
+
+-spec create_database(ClusterFile :: binary()) ->
+    {erlfdb_database, pid(), reference()}.
+create_database(ClusterFile) ->
+    ok = ensure_started(),
+    Worker = erlfdb_worker_sup:pick_worker(),
+    DbRef = make_ref(),
+    case gen_server:call(Worker, {request, create_database, {DbRef, ClusterFile}}) of
+        ok ->
+            {erlfdb_database, Worker, DbRef};
+        {error, Code} when is_integer(Code) ->
+            erlang:error({erlfdb_error, Code});
+        {error, Reason} ->
+            erlang:error({erlfdb_error, Reason})
+    end.
+
+-spec database_create_transaction({erlfdb_database, pid(), reference()}) ->
+    {erlfdb_transaction, pid(), reference()}.
+database_create_transaction({erlfdb_database, Worker, DbRef}) ->
+    TxRef = make_ref(),
+    case gen_server:call(Worker, {request, database_create_transaction, {DbRef, TxRef}}) of
+        ok ->
+            {erlfdb_transaction, Worker, TxRef};
+        {error, Code} when is_integer(Code) ->
+            erlang:error({erlfdb_error, Code});
         {error, Reason} ->
             erlang:error({erlfdb_error, Reason})
     end.

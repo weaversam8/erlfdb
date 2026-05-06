@@ -51,7 +51,7 @@ RPATH_FDB_FLAGS := -Wl,-rpath,\$$ORIGIN -Wl,-rpath,"$(ERLFDB_FDB_LIB_DIR)"
 endif
 
 # Sources
-WORKER_SRC := worker.c
+WORKER_SRC := worker.c registry.c
 WORKER_OBJ := $(WORKER_SRC:.c=.worker.o)
 
 .PHONY: all clean

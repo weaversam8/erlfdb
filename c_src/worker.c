@@ -38,6 +38,43 @@
 #define FDB_API_VERSION 0
 #endif
 #include "fdb.h"
+#include "registry.h"
+
+// ---------------------------------------------------------------------------
+// Resource registries — one per FDB handle type
+// ---------------------------------------------------------------------------
+
+static erlfdb_registry db_registry;
+static erlfdb_registry tenant_registry;
+static erlfdb_registry tx_registry;
+static erlfdb_registry future_registry;
+
+static void registries_init(void) {
+    erlfdb_registry_init(&db_registry);
+    erlfdb_registry_init(&tenant_registry);
+    erlfdb_registry_init(&tx_registry);
+    erlfdb_registry_init(&future_registry);
+}
+
+static void fdb_database_destroy_cb(void *v) {
+    if (v) fdb_database_destroy((FDBDatabase *)v);
+}
+static void fdb_tenant_destroy_cb(void *v) {
+    if (v) fdb_tenant_destroy((FDBTenant *)v);
+}
+static void fdb_transaction_destroy_cb(void *v) {
+    if (v) fdb_transaction_destroy((FDBTransaction *)v);
+}
+static void fdb_future_destroy_cb(void *v) {
+    if (v) fdb_future_destroy((FDBFuture *)v);
+}
+
+static void registries_destroy(void) {
+    erlfdb_registry_destroy(&db_registry, fdb_database_destroy_cb);
+    erlfdb_registry_destroy(&tenant_registry, fdb_tenant_destroy_cb);
+    erlfdb_registry_destroy(&tx_registry, fdb_transaction_destroy_cb);
+    erlfdb_registry_destroy(&future_registry, fdb_future_destroy_cb);
+}
 
 // ---------------------------------------------------------------------------
 // Network thread state
@@ -162,6 +199,22 @@ static int send_reply_ok_long(long req_id, long value) {
     ei_x_encode_tuple_header(&x, 2);
     ei_x_encode_atom(&x, "ok");
     ei_x_encode_long(&x, value);
+    int rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+    ei_x_free(&x);
+    return rc;
+}
+
+// Send {reply, ReqId, {error, FdbErrorCode}} where the code is an integer,
+// matching {erlfdb_error, Code} semantics on the Erlang side.
+static int send_reply_fdb_error(long req_id, fdb_error_t err) {
+    ei_x_buff x;
+    if (ei_x_new_with_version(&x) != 0) return -1;
+    ei_x_encode_tuple_header(&x, 3);
+    ei_x_encode_atom(&x, "reply");
+    ei_x_encode_long(&x, req_id);
+    ei_x_encode_tuple_header(&x, 2);
+    ei_x_encode_atom(&x, "error");
+    ei_x_encode_long(&x, (long)err);
     int rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
     ei_x_free(&x);
     return rc;
@@ -332,6 +385,89 @@ static int dispatch_init(long req_id, const char *buf, int *idx) {
     pthread_mutex_unlock(&g_init_mutex);
 
     g_network_running = 1;
+    registries_init();
+    return send_reply_ok(req_id);
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch: create_database
+// ---------------------------------------------------------------------------
+
+static int dispatch_create_database(long req_id, const char *buf, int *idx) {
+    // Decode {DbRef, ClusterFile}
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 2) {
+        return send_reply_error(req_id, "bad_args");
+    }
+
+    erlang_ref db_ref;
+    if (ei_decode_ref(buf, idx, &db_ref) != 0) {
+        return send_reply_error(req_id, "bad_db_ref");
+    }
+
+    // Cluster file arrives as a binary; C side adds its own null terminator.
+    int type = 0;
+    int bin_size = 0;
+    if (ei_get_type(buf, idx, &type, &bin_size) != 0) {
+        return send_reply_error(req_id, "bad_cluster_file_type");
+    }
+    char *cluster_file = (char *)malloc((size_t)bin_size + 1);
+    if (!cluster_file) return -1;
+    long actual_len = (long)bin_size;
+    if (ei_decode_binary(buf, idx, cluster_file, &actual_len) != 0) {
+        free(cluster_file);
+        return send_reply_error(req_id, "bad_cluster_file");
+    }
+    cluster_file[bin_size] = '\0';
+
+    FDBDatabase *database = NULL;
+    fdb_error_t err = fdb_create_database(cluster_file, &database);
+    free(cluster_file);
+
+    if (err != 0) return send_reply_fdb_error(req_id, err);
+
+    if (erlfdb_registry_put(&db_registry, &db_ref, database, NULL) != 0) {
+        fdb_database_destroy(database);
+        return send_reply_error(req_id, "registry_alloc_failed");
+    }
+
+    return send_reply_ok(req_id);
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch: database_create_transaction
+// ---------------------------------------------------------------------------
+
+static int dispatch_database_create_transaction(long req_id, const char *buf,
+                                                int *idx) {
+    // Decode {DbRef, TxRef}
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 2) {
+        return send_reply_error(req_id, "bad_args");
+    }
+
+    erlang_ref db_ref;
+    if (ei_decode_ref(buf, idx, &db_ref) != 0) {
+        return send_reply_error(req_id, "bad_db_ref");
+    }
+
+    erlang_ref tx_ref;
+    if (ei_decode_ref(buf, idx, &tx_ref) != 0) {
+        return send_reply_error(req_id, "bad_tx_ref");
+    }
+
+    FDBDatabase *database = (FDBDatabase *)erlfdb_registry_get(&db_registry, &db_ref);
+    if (!database) return send_reply_error(req_id, "unknown_db");
+
+    FDBTransaction *transaction = NULL;
+    fdb_error_t err = fdb_database_create_transaction(database, &transaction);
+    if (err != 0) return send_reply_fdb_error(req_id, err);
+
+    if (erlfdb_registry_put(&tx_registry, &tx_ref, transaction, NULL) != 0) {
+        fdb_transaction_destroy(transaction);
+        return send_reply_error(req_id, "registry_alloc_failed");
+    }
+
     return send_reply_ok(req_id);
 }
 
@@ -363,6 +499,10 @@ static int handle_request(const uint8_t *buf, uint32_t len) {
         return dispatch_init(req_id, (const char *)buf, &idx);
     } else if (strcmp(op, "get_max_api_version") == 0) {
         return send_reply_ok_long(req_id, (long)fdb_get_max_api_version());
+    } else if (strcmp(op, "create_database") == 0) {
+        return dispatch_create_database(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "database_create_transaction") == 0) {
+        return dispatch_database_create_transaction(req_id, (const char *)buf, &idx);
     }
 
     return send_reply_error(req_id, "unknown_op");
@@ -384,9 +524,10 @@ int main(int argc, char **argv) {
         int r = read_frame(&frame, &flen);
         if (r == 0) {
             // EOF: BEAM closed the port (clean shutdown or hard crash).
-            // Stop the FDB network and join the thread before exiting so
-            // libfdb_c can flush any in-flight work.
+            // Destroy all live FDB resources, stop the network, join the
+            // thread so libfdb_c can flush in-flight work.
             if (g_network_running) {
+                registries_destroy();
                 fdb_stop_network();
                 pthread_join(g_network_tid, NULL);
             }

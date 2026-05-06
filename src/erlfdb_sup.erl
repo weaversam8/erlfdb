@@ -28,6 +28,11 @@ init([]) ->
     SupFlags = #{strategy => one_for_all, intensity => 5, period => 10},
     Children = [
         #{
+            id => erlfdb_worker_pool,
+            start => {erlfdb_worker_pool, start_link, []},
+            type => worker
+        },
+        #{
             id => erlfdb_worker_sup,
             start => {erlfdb_worker_sup, start_link, []},
             type => supervisor

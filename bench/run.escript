@@ -7,16 +7,20 @@
 %% avg/p50/p95/p99/max latency (microseconds) and the overhead ratio.
 %%
 %% Usage:
-%%   rebar3 as test compile
-%%   ERL_LIBS=_build/test/lib/erlfdb escript bench/run.escript [iterations]
+%%   rebar3 compile
+%%   ERL_LIBS=_build/default/lib/erlfdb escript bench/run.escript [iterations]
 %%
 %% The optional first argument overrides the default iteration count (10 000).
+%% Individual benchmarks can set a lower cap (see benchmarks/1 below).
 %%
 %% Adding a new benchmark:
-%%   1. Add an entry to the list returned by benchmarks/1 (which receives the
-%%      open Db handle so lambdas can close over it).
-%%   2. The entry shape is {Label :: string(), NifFun :: fun(), PortFun :: fun()}.
-%%   3. Both funs must be 0-arity; wrap any arguments in the closure.
+%%   Add a tuple to the list returned by benchmarks/1. The map argument
+%%   carries nif_db, port_db, and cluster_file so lambdas can close over
+%%   whichever handle they need.
+%%
+%%   Tuple shapes:
+%%     {Label, NifFun, PortFun}           -- uses the global N
+%%     {Label, NifFun, PortFun, MaxN}     -- caps at MaxN regardless of global N
 
 -mode(compile).
 
@@ -26,56 +30,58 @@
 main(Args) ->
     N = parse_n(Args),
     io:format("~n=== erlfdb benchmark suite ===~n"),
-    io:format("Iterations per benchmark: ~p~n~n", [N]),
+    io:format("Default iterations: ~p~n~n", [N]),
 
     %% Start the erlfdb application (boots the port worker pool).
     {ok, _} = application:ensure_all_started(erlfdb),
 
-    %% Create a sandbox DB and seed it with test data.  The Db handle is
-    %% passed to benchmarks/1 so future lambdas can close over it.
-    Db = setup_db(),
+    %% Create a sandbox DB and seed it with test data.
+    DbMap = setup_db(),
 
-    %% Run every registered benchmark.
-    lists:foreach(
-        fun({Label, NifFun, PortFun}) ->
-            io:format("--- ~s ---~n", [Label]),
-            erlfdb_bench:compare(NifFun, "nif", PortFun, "port", N),
-            io:format("~n")
-        end,
-        benchmarks(Db)
-    ),
-
+    run_all(DbMap, N),
     halt(0).
 
 %% ---------------------------------------------------------------------------
 %% Benchmark registry
-%% Add new {Label, NifFun, PortFun} tuples here as operations are ported.
+%%
+%% Each entry: {Label, NifFun, PortFun} or {Label, NifFun, PortFun, MaxN}.
 %% ---------------------------------------------------------------------------
 
-benchmarks(_Db) ->
+benchmarks(#{
+    nif_db := NifDb,
+    port_db := PortDb,
+    cluster_file := ClusterFile
+}) ->
     [
         {
             "get_max_api_version",
             fun erlfdb_nif:get_max_api_version/0,
             fun erlfdb_port:get_max_api_version/0
+        },
+        {
+            "create_database",
+            fun() -> erlfdb_nif:create_database(ClusterFile) end,
+            fun() -> erlfdb_port:create_database(ClusterFile) end,
+            %% Each call opens an FDB client connection; keep iterations low.
+            500
+        },
+        {
+            "database_create_transaction",
+            fun() -> erlfdb_nif:database_create_transaction(NifDb) end,
+            fun() -> erlfdb_port:database_create_transaction(PortDb) end
         }
 
         %% Future examples (uncomment when the port ops are implemented):
         %%
         %% {
-        %%     "create_transaction",
-        %%     fun() -> erlfdb_nif:database_create_transaction(Db) end,
-        %%     fun() -> erlfdb_port:database_create_transaction(Db) end
-        %% },
-        %% {
         %%     "get (hot key, snapshot)",
         %%     fun() ->
-        %%         erlfdb:transactional(Db, fun(Tx) ->
+        %%         erlfdb:transactional(NifDb, fun(Tx) ->
         %%             erlfdb:wait(erlfdb:get(erlfdb:snapshot(Tx), bench_key(1)))
         %%         end)
         %%     end,
         %%     fun() ->
-        %%         erlfdb_port:transactional(Db, fun(Tx) ->
+        %%         erlfdb_port:transactional(PortDb, fun(Tx) ->
         %%             erlfdb_port:wait(erlfdb_port:get(erlfdb_port:snapshot(Tx), bench_key(1)))
         %%         end)
         %%     end
@@ -83,29 +89,53 @@ benchmarks(_Db) ->
     ].
 
 %% ---------------------------------------------------------------------------
+%% Runner
+%% ---------------------------------------------------------------------------
+
+run_all(DbMap, N) ->
+    lists:foreach(
+        fun(Entry) ->
+            {Label, NifFun, PortFun, BenchN} =
+                case Entry of
+                    {L, F1, F2} -> {L, F1, F2, N};
+                    {L, F1, F2, Max} -> {L, F1, F2, min(N, Max)}
+                end,
+            io:format("--- ~s ---~n", [Label]),
+            erlfdb_bench:compare(NifFun, "nif", PortFun, "port", BenchN),
+            io:format("~n")
+        end,
+        benchmarks(DbMap)
+    ).
+
+%% ---------------------------------------------------------------------------
 %% DB setup
 %% ---------------------------------------------------------------------------
 
 setup_db() ->
     io:format("Starting sandbox fdbserver...~n"),
-    Db = erlfdb_sandbox:open(<<"bench">>),
+    Options = erlfdb_sandbox:default_options(),
+    {ok, ClusterFile} = erlfdb_util:init_test_cluster(Options),
+
+    %% One NIF-backed handle and one port-backed handle from the same server.
+    NifDb = erlfdb:open(ClusterFile),
+    PortDb = erlfdb_port:create_database(ClusterFile),
+
     io:format("Seeding ~p keys...~n", [?SEED_KEY_COUNT]),
-    erlfdb:transactional(Db, fun(Tx) ->
+    erlfdb:transactional(NifDb, fun(Tx) ->
         lists:foreach(
-            fun(I) ->
-                erlfdb:set(Tx, bench_key(I), bench_val(I))
-            end,
+            fun(I) -> erlfdb:set(Tx, bench_key(I), bench_val(I)) end,
             lists:seq(1, ?SEED_KEY_COUNT)
         )
     end),
     io:format("DB ready.~n~n"),
-    Db.
+    #{
+        nif_db => NifDb,
+        port_db => PortDb,
+        cluster_file => ClusterFile
+    }.
 
-bench_key(I) ->
-    iolist_to_binary(io_lib:format("bench_key_~6..0b", [I])).
-
-bench_val(I) ->
-    iolist_to_binary(io_lib:format("bench_val_~6..0b", [I])).
+bench_key(I) -> iolist_to_binary(io_lib:format("bench_key_~6..0b", [I])).
+bench_val(I) -> iolist_to_binary(io_lib:format("bench_val_~6..0b", [I])).
 
 %% ---------------------------------------------------------------------------
 %% Argument parsing
