@@ -64,7 +64,12 @@ init([WorkerIx]) ->
     ),
     case wait_for_hello(Port, ?HELLO_TIMEOUT_MS) of
         {ok, OsPid} ->
-            case run_init_handshake(Port, ?INIT_TIMEOUT_MS) of
+            InitArgs =
+                case application:get_env(erlfdb, init_request_args) of
+                    {ok, Args} -> Args;
+                    undefined -> {erlfdb_nif:get_default_api_version(), []}
+                end,
+            case run_init_handshake(Port, InitArgs, ?INIT_TIMEOUT_MS) of
                 ok ->
                     %% Advertise this pid so erlfdb_port can route without
                     %% consulting the supervisor. Overwrites any stale entry
@@ -174,11 +179,12 @@ wait_for_hello(Port, TimeoutMs) ->
         {error, hello_timeout}
     end.
 
-%% Send an `{req, 1, init, {}}` and wait for `{reply, 1, ok}`. Step 4 will
-%% replace the empty `{}` with the resolved network options.
-run_init_handshake(Port, TimeoutMs) ->
+%% Send `{req, 1, init, {ApiVersion, [{Name, BinVal}, ...]}}` and wait for
+%% `{reply, 1, ok}`. InitArgs is the `{ApiVersion, NormalizedOpts}` tuple
+%% resolved by erlfdb_app:start/2.
+run_init_handshake(Port, InitArgs, TimeoutMs) ->
     ReqId = 1,
-    Frame = term_to_binary({req, ReqId, init, {}}),
+    Frame = term_to_binary({req, ReqId, init, InitArgs}),
     true = port_command(Port, Frame),
     receive
         {Port, {data, ReplyBin}} ->
