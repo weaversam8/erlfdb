@@ -14,7 +14,21 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-snapshot_from_tx_test() ->
+-define(BACKENDS, [erlfdb_nif, erlfdb_port]).
+
+backends_test_() ->
+    Tests = [
+        fun t_snapshot_from_tx/0,
+        fun t_snapshot_from_a_snapshot/0
+    ],
+    [{atom_to_list(B),
+      {setup,
+       fun() -> application:set_env(erlfdb, backend, B) end,
+       fun(_) -> application:set_env(erlfdb, backend, erlfdb_port) end,
+       Tests}}
+     || B <- ?BACKENDS].
+
+t_snapshot_from_tx() ->
     Db = erlfdb_sandbox:open(),
     Key = gen(10),
     Val = gen(10),
@@ -25,7 +39,7 @@ snapshot_from_tx_test() ->
         ?assertEqual(Val, erlfdb:wait(erlfdb:get(Ss, Key)))
     end).
 
-snapshot_from_a_snapshot_test() ->
+t_snapshot_from_a_snapshot() ->
     Db = erlfdb_sandbox:open(),
     Key = gen(10),
     Val = gen(10),

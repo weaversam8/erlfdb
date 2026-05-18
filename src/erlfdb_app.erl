@@ -58,7 +58,7 @@ stop(_State) ->
 resolve_api_version() ->
     case application:get_env(erlfdb, api_version) of
         {ok, V} when is_integer(V), V > 0 -> V;
-        _ -> erlfdb_nif:get_default_api_version()
+        _ -> erlfdb_port:get_default_api_version()
     end.
 
 resolve_network_options() ->

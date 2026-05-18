@@ -314,6 +314,20 @@ static int send_reply_ok_binary(long req_id, const uint8_t *data, int len) {
     return rc;
 }
 
+static int send_reply_ok_double(long req_id, double value) {
+    ei_x_buff x;
+    if (ei_x_new_with_version(&x) != 0) return -1;
+    ei_x_encode_tuple_header(&x, 3);
+    ei_x_encode_atom(&x, "reply");
+    ei_x_encode_long(&x, req_id);
+    ei_x_encode_tuple_header(&x, 2);
+    ei_x_encode_atom(&x, "ok");
+    ei_x_encode_double(&x, value);
+    int rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+    ei_x_free(&x);
+    return rc;
+}
+
 static int send_reply_not_found(long req_id) {
     ei_x_buff x;
     if (ei_x_new_with_version(&x) != 0) return -1;
@@ -754,6 +768,146 @@ static int dispatch_future_get(long req_id, const char *buf, int *idx) {
             else rc = send_reply_ok_binary(req_id, val, len);
             break;
         }
+        case ERLFDB_FUT_INT64: {
+            int64_t val = 0;
+            fdb_error_t err = fdb_future_get_int64(ft->future, &val);
+            rc = (err != 0) ? send_reply_fdb_error(req_id, err)
+                            : send_reply_ok_long(req_id, (long)val);
+            break;
+        }
+        case ERLFDB_FUT_KEY: {
+            const uint8_t *key = NULL;
+            int klen = 0;
+            fdb_error_t err = fdb_future_get_key(ft->future, &key, &klen);
+            rc = (err != 0) ? send_reply_fdb_error(req_id, err)
+                            : send_reply_ok_binary(req_id, key, klen);
+            break;
+        }
+        case ERLFDB_FUT_STRING_ARRAY: {
+            const char **strings = NULL;
+            int count = 0;
+            fdb_error_t err = fdb_future_get_string_array(ft->future, &strings, &count);
+            if (err != 0) {
+                rc = send_reply_fdb_error(req_id, err);
+            } else {
+                ei_x_buff x;
+                if (ei_x_new_with_version(&x) != 0) { rc = -1; break; }
+                ei_x_encode_tuple_header(&x, 3);
+                ei_x_encode_atom(&x, "reply");
+                ei_x_encode_long(&x, req_id);
+                ei_x_encode_tuple_header(&x, 2);
+                ei_x_encode_atom(&x, "ok");
+                if (count > 0) ei_x_encode_list_header(&x, count);
+                for (int i = 0; i < count; i++)
+                    ei_x_encode_binary(&x, strings[i], (long)strlen(strings[i]));
+                ei_x_encode_empty_list(&x);
+                rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+                ei_x_free(&x);
+            }
+            break;
+        }
+        case ERLFDB_FUT_KEY_ARRAY: {
+            FDBKey const *keys = NULL;
+            int count = 0;
+            fdb_error_t err = fdb_future_get_key_array(ft->future, &keys, &count);
+            if (err != 0) {
+                rc = send_reply_fdb_error(req_id, err);
+            } else {
+                ei_x_buff x;
+                if (ei_x_new_with_version(&x) != 0) { rc = -1; break; }
+                ei_x_encode_tuple_header(&x, 3);
+                ei_x_encode_atom(&x, "reply");
+                ei_x_encode_long(&x, req_id);
+                ei_x_encode_tuple_header(&x, 2);
+                ei_x_encode_atom(&x, "ok");
+                if (count > 0) ei_x_encode_list_header(&x, count);
+                for (int i = 0; i < count; i++)
+                    ei_x_encode_binary(&x, keys[i].key, keys[i].key_length);
+                ei_x_encode_empty_list(&x);
+                rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+                ei_x_free(&x);
+            }
+            break;
+        }
+        case ERLFDB_FUT_KEYVALUE_ARRAY: {
+            FDBKeyValue const *kvs = NULL;
+            fdb_bool_t more = 0;
+            int count = 0;
+            fdb_error_t err = fdb_future_get_keyvalue_array(ft->future, &kvs, &count, &more);
+            if (err != 0) {
+                rc = send_reply_fdb_error(req_id, err);
+            } else {
+                ei_x_buff x;
+                if (ei_x_new_with_version(&x) != 0) { rc = -1; break; }
+                ei_x_encode_tuple_header(&x, 3);
+                ei_x_encode_atom(&x, "reply");
+                ei_x_encode_long(&x, req_id);
+                ei_x_encode_tuple_header(&x, 2);
+                ei_x_encode_atom(&x, "ok");
+                ei_x_encode_tuple_header(&x, 3);  /* {KVList, Count, More} */
+                if (count > 0) ei_x_encode_list_header(&x, count);
+                for (int i = 0; i < count; i++) {
+                    ei_x_encode_tuple_header(&x, 2);
+                    ei_x_encode_binary(&x, kvs[i].key, kvs[i].key_length);
+                    ei_x_encode_binary(&x, kvs[i].value, kvs[i].value_length);
+                }
+                ei_x_encode_empty_list(&x);
+                ei_x_encode_long(&x, (long)count);
+                ei_x_encode_atom(&x, more ? "true" : "false");
+                rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+                ei_x_free(&x);
+            }
+            break;
+        }
+        case ERLFDB_FUT_MAPPEDKEYVALUE_ARRAY: {
+#if FDB_API_VERSION >= 730
+            FDBMappedKeyValue const *mkvs = NULL;
+            fdb_bool_t more = 0;
+            int count = 0;
+            fdb_error_t err = fdb_future_get_mappedkeyvalue_array(
+                ft->future, &mkvs, &count, &more);
+            if (err != 0) {
+                rc = send_reply_fdb_error(req_id, err);
+            } else {
+                ei_x_buff x;
+                if (ei_x_new_with_version(&x) != 0) { rc = -1; break; }
+                ei_x_encode_tuple_header(&x, 3);
+                ei_x_encode_atom(&x, "reply");
+                ei_x_encode_long(&x, req_id);
+                ei_x_encode_tuple_header(&x, 2);
+                ei_x_encode_atom(&x, "ok");
+                ei_x_encode_tuple_header(&x, 3);  /* {MKVList, Count, More} */
+                if (count > 0) ei_x_encode_list_header(&x, count);
+                for (int i = 0; i < count; i++) {
+                    const FDBMappedKeyValue *mkv = &mkvs[i];
+                    const FDBGetRangeReqAndResult *gr = &mkv->getRange;
+                    /* {{PQKey, PQVal}, {SQBegin, SQEnd}, [{MK, MV},...]} */
+                    ei_x_encode_tuple_header(&x, 3);
+                    ei_x_encode_tuple_header(&x, 2);
+                    ei_x_encode_binary(&x, mkv->key.key, mkv->key.key_length);
+                    ei_x_encode_binary(&x, mkv->value.key, mkv->value.key_length);
+                    ei_x_encode_tuple_header(&x, 2);
+                    ei_x_encode_binary(&x, gr->begin.key.key, gr->begin.key.key_length);
+                    ei_x_encode_binary(&x, gr->end.key.key, gr->end.key.key_length);
+                    if (gr->m_size > 0) ei_x_encode_list_header(&x, gr->m_size);
+                    for (int j = 0; j < gr->m_size; j++) {
+                        ei_x_encode_tuple_header(&x, 2);
+                        ei_x_encode_binary(&x, gr->data[j].key, gr->data[j].key_length);
+                        ei_x_encode_binary(&x, gr->data[j].value, gr->data[j].value_length);
+                    }
+                    ei_x_encode_empty_list(&x);
+                }
+                ei_x_encode_empty_list(&x);
+                ei_x_encode_long(&x, (long)count);
+                ei_x_encode_atom(&x, more ? "true" : "false");
+                rc = write_frame((uint8_t *)x.buff, (uint32_t)x.index);
+                ei_x_free(&x);
+            }
+#else
+            rc = send_reply_error(req_id, "not_supported");
+#endif
+            break;
+        }
         default:
             rc = send_reply_error(req_id, "unsupported_future_type");
     }
@@ -872,6 +1026,87 @@ static int decode_binary(const char *buf, int *idx, long req_id,
     return 0;
 }
 
+// Decode a key_selector tuple {KeyBinary, Atom} or {KeyBinary, Atom, Offset}.
+// Returns 0 on success; on error sends a reply and returns non-zero.
+// Caller must free *key_out on success.
+static int decode_key_selector(const char *buf, int *idx, long req_id,
+                                uint8_t **key_out, int *klen_out,
+                                fdb_bool_t *or_equal_out, int *offset_out) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || (arity != 2 && arity != 3))
+        return send_reply_error(req_id, "bad_key_selector");
+    int r = decode_binary(buf, idx, req_id, key_out, klen_out);
+    if (r != 0) return r;
+    int or_equal = 0, offset = 0;
+    int type = 0, sz = 0;
+    if (ei_get_type(buf, idx, &type, &sz) != 0) {
+        free(*key_out); *key_out = NULL;
+        return send_reply_error(req_id, "bad_ks_cmp");
+    }
+    if (type == ERL_ATOM_EXT || type == ERL_SMALL_ATOM_EXT ||
+        type == ERL_ATOM_UTF8_EXT || type == ERL_SMALL_ATOM_UTF8_EXT) {
+        char atom[MAXATOMLEN + 1] = {0};
+        if (ei_decode_atom(buf, idx, atom) != 0) {
+            free(*key_out); *key_out = NULL;
+            return send_reply_error(req_id, "bad_ks_atom");
+        }
+        if      (strcmp(atom, "lt")   == 0) { or_equal = 0; offset = 0; }
+        else if (strcmp(atom, "lteq") == 0) { or_equal = 1; offset = 0; }
+        else if (strcmp(atom, "gt")   == 0) { or_equal = 1; offset = 1; }
+        else if (strcmp(atom, "gteq") == 0) { or_equal = 0; offset = 1; }
+        else if (strcmp(atom, "true") == 0) { or_equal = 1; offset = 0; }
+        else if (strcmp(atom, "false")== 0) { or_equal = 0; offset = 0; }
+        else { free(*key_out); *key_out = NULL; return send_reply_error(req_id, "unknown_ks_cmp"); }
+    } else {
+        long oe = 0;
+        if (ei_decode_long(buf, idx, &oe) != 0) {
+            free(*key_out); *key_out = NULL;
+            return send_reply_error(req_id, "bad_ks_oe");
+        }
+        or_equal = oe ? 1 : 0;
+    }
+    if (arity == 3) {
+        long add_off = 0;
+        if (ei_decode_long(buf, idx, &add_off) != 0) {
+            free(*key_out); *key_out = NULL;
+            return send_reply_error(req_id, "bad_ks_offset");
+        }
+        offset += (int)add_off;
+    }
+    *or_equal_out = (fdb_bool_t)or_equal;
+    *offset_out   = offset;
+    return 0;
+}
+
+// Decode a streaming mode atom (want_all|iterator|exact|small|medium|large|serial).
+// Returns 0 on success; on error sends a reply and returns non-zero.
+static int decode_streaming_mode(const char *buf, int *idx, long req_id,
+                                  FDBStreamingMode *mode_out) {
+    int type = 0, sz = 0;
+    if (ei_get_type(buf, idx, &type, &sz) != 0)
+        return send_reply_error(req_id, "bad_streaming_mode");
+    if (type == ERL_ATOM_EXT || type == ERL_SMALL_ATOM_EXT ||
+        type == ERL_ATOM_UTF8_EXT || type == ERL_SMALL_ATOM_UTF8_EXT) {
+        char atom[MAXATOMLEN + 1] = {0};
+        if (ei_decode_atom(buf, idx, atom) != 0)
+            return send_reply_error(req_id, "bad_streaming_mode_atom");
+        if      (strcmp(atom, "want_all") == 0) *mode_out = FDB_STREAMING_MODE_WANT_ALL;
+        else if (strcmp(atom, "iterator") == 0) *mode_out = FDB_STREAMING_MODE_ITERATOR;
+        else if (strcmp(atom, "exact")    == 0) *mode_out = FDB_STREAMING_MODE_EXACT;
+        else if (strcmp(atom, "small")    == 0) *mode_out = FDB_STREAMING_MODE_SMALL;
+        else if (strcmp(atom, "medium")   == 0) *mode_out = FDB_STREAMING_MODE_MEDIUM;
+        else if (strcmp(atom, "large")    == 0) *mode_out = FDB_STREAMING_MODE_LARGE;
+        else if (strcmp(atom, "serial")   == 0) *mode_out = FDB_STREAMING_MODE_SERIAL;
+        else return send_reply_error(req_id, "unknown_streaming_mode");
+    } else {
+        long m = 0;
+        if (ei_decode_long(buf, idx, &m) != 0)
+            return send_reply_error(req_id, "bad_streaming_mode_int");
+        *mode_out = (FDBStreamingMode)m;
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Sync transaction dispatchers
 // ---------------------------------------------------------------------------
@@ -887,6 +1122,7 @@ static int dispatch_transaction_set(long req_id, const char *buf, int *idx) {
     int klen = 0, vlen = 0;
     if ((r = decode_binary(buf, idx, req_id, &key, &klen)) != 0) return r;
     if ((r = decode_binary(buf, idx, req_id, &val, &vlen)) != 0) { free(key); return r; }
+    if (!tx->writes_allowed) { free(key); free(val); return send_reply_error(req_id, "writes_not_allowed"); }
     fdb_transaction_set(tx->transaction, key, klen, val, vlen);
     free(key); free(val);
     tx->read_only = 0;
@@ -902,6 +1138,7 @@ static int dispatch_transaction_clear(long req_id, const char *buf, int *idx) {
     if (r != 0 || !tx) return r;
     uint8_t *key = NULL; int klen = 0;
     if ((r = decode_binary(buf, idx, req_id, &key, &klen)) != 0) return r;
+    if (!tx->writes_allowed) { free(key); return send_reply_error(req_id, "writes_not_allowed"); }
     fdb_transaction_clear(tx->transaction, key, klen);
     free(key);
     tx->read_only = 0;
@@ -919,6 +1156,7 @@ static int dispatch_transaction_clear_range(long req_id, const char *buf,
     uint8_t *skey = NULL, *ekey = NULL; int slen = 0, elen = 0;
     if ((r = decode_binary(buf, idx, req_id, &skey, &slen)) != 0) return r;
     if ((r = decode_binary(buf, idx, req_id, &ekey, &elen)) != 0) { free(skey); return r; }
+    if (!tx->writes_allowed) { free(skey); free(ekey); return send_reply_error(req_id, "writes_not_allowed"); }
     fdb_transaction_clear_range(tx->transaction, skey, slen, ekey, elen);
     free(skey); free(ekey);
     tx->read_only = 0;
@@ -946,6 +1184,7 @@ static int dispatch_transaction_atomic_op(long req_id, const char *buf,
         free(key); free(param);
         return send_reply_error(req_id, "unknown_mutation_type");
     }
+    if (!tx->writes_allowed) { free(key); free(param); return send_reply_error(req_id, "writes_not_allowed"); }
     fdb_transaction_atomic_op(tx->transaction, key, klen, param, plen, mtype);
     free(key); free(param);
     tx->read_only = 0;
@@ -1124,6 +1363,598 @@ static int dispatch_transaction_get_writes_allowed(long req_id, const char *buf,
 }
 
 // ---------------------------------------------------------------------------
+// Database option lookup
+// ---------------------------------------------------------------------------
+
+typedef struct { const char *name; FDBDatabaseOption opt; } db_option_entry;
+static const db_option_entry db_option_map[] = {
+    {"location_cache_size",                    FDB_DB_OPTION_LOCATION_CACHE_SIZE},
+    {"max_watches",                            FDB_DB_OPTION_MAX_WATCHES},
+    {"machine_id",                             FDB_DB_OPTION_MACHINE_ID},
+    {"datacenter_id",                          FDB_DB_OPTION_DATACENTER_ID},
+    {"snapshot_ryw_enable",                    FDB_DB_OPTION_SNAPSHOT_RYW_ENABLE},
+    {"snapshot_ryw_disable",                   FDB_DB_OPTION_SNAPSHOT_RYW_DISABLE},
+    {"transaction_logging_max_field_length",   FDB_DB_OPTION_TRANSACTION_LOGGING_MAX_FIELD_LENGTH},
+    {"transaction_timeout",                    FDB_DB_OPTION_TRANSACTION_TIMEOUT},
+    {"transaction_retry_limit",                FDB_DB_OPTION_TRANSACTION_RETRY_LIMIT},
+    {"transaction_max_retry_delay",            FDB_DB_OPTION_TRANSACTION_MAX_RETRY_DELAY},
+    {"transaction_size_limit",                 FDB_DB_OPTION_TRANSACTION_SIZE_LIMIT},
+    {"transaction_causal_read_risky",          FDB_DB_OPTION_TRANSACTION_CAUSAL_READ_RISKY},
+    {"transaction_include_port_in_address",    FDB_DB_OPTION_TRANSACTION_INCLUDE_PORT_IN_ADDRESS},
+    /* Aliases matching erlfdb:set_option/2,3 call sites */
+    {"size_limit",                             FDB_DB_OPTION_TRANSACTION_SIZE_LIMIT},
+    {"timeout",                                FDB_DB_OPTION_TRANSACTION_TIMEOUT},
+    {"retry_limit",                            FDB_DB_OPTION_TRANSACTION_RETRY_LIMIT},
+    {"max_retry_delay",                        FDB_DB_OPTION_TRANSACTION_MAX_RETRY_DELAY},
+    {"causal_read_risky",                      FDB_DB_OPTION_TRANSACTION_CAUSAL_READ_RISKY},
+};
+static int lookup_db_option(const char *name, FDBDatabaseOption *out) {
+    size_t n = sizeof(db_option_map) / sizeof(db_option_map[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(name, db_option_map[i].name) == 0) { *out = db_option_map[i].opt; return 1; }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Database operation dispatchers
+// ---------------------------------------------------------------------------
+
+static int dispatch_database_set_option(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 3)
+        return send_reply_error(req_id, "bad_args");
+    erlang_ref db_ref;
+    if (ei_decode_ref(buf, idx, &db_ref) != 0)
+        return send_reply_error(req_id, "bad_db_ref");
+    FDBDatabase *db = (FDBDatabase *)erlfdb_registry_get(&db_registry, &db_ref);
+    if (!db) return send_reply_error(req_id, "unknown_db");
+    char opt_name[MAXATOMLEN + 1] = {0};
+    if (ei_decode_atom(buf, idx, opt_name) != 0)
+        return send_reply_error(req_id, "bad_option_name");
+    uint8_t *val = NULL; int vlen = 0;
+    int r = decode_binary(buf, idx, req_id, &val, &vlen);
+    if (r != 0) return r;
+    FDBDatabaseOption fdb_opt;
+    fdb_error_t err = 0;
+    if (lookup_db_option(opt_name, &fdb_opt))
+        err = fdb_database_set_option(db, fdb_opt, val, vlen);
+    free(val);
+    if (err != 0) return send_reply_fdb_error(req_id, err);
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_database_open_tenant(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 3)
+        return send_reply_error(req_id, "bad_args");
+    erlang_ref db_ref;
+    if (ei_decode_ref(buf, idx, &db_ref) != 0)
+        return send_reply_error(req_id, "bad_db_ref");
+    FDBDatabase *db = (FDBDatabase *)erlfdb_registry_get(&db_registry, &db_ref);
+    if (!db) return send_reply_error(req_id, "unknown_db");
+    erlang_ref tenant_ref;
+    if (ei_decode_ref(buf, idx, &tenant_ref) != 0)
+        return send_reply_error(req_id, "bad_tenant_ref");
+    uint8_t *name = NULL; int nlen = 0;
+    int r = decode_binary(buf, idx, req_id, &name, &nlen);
+    if (r != 0) return r;
+    FDBTenant *tenant = NULL;
+    fdb_error_t err = fdb_database_open_tenant(db, name, nlen, &tenant);
+    free(name);
+    if (err != 0) return send_reply_fdb_error(req_id, err);
+    if (erlfdb_registry_put(&tenant_registry, &tenant_ref, tenant, NULL) != 0) {
+        fdb_tenant_destroy(tenant);
+        return send_reply_error(req_id, "registry_alloc_failed");
+    }
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_tenant_create_transaction(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 2)
+        return send_reply_error(req_id, "bad_args");
+    erlang_ref tenant_ref;
+    if (ei_decode_ref(buf, idx, &tenant_ref) != 0)
+        return send_reply_error(req_id, "bad_tenant_ref");
+    FDBTenant *tenant = (FDBTenant *)erlfdb_registry_get(&tenant_registry, &tenant_ref);
+    if (!tenant) return send_reply_error(req_id, "unknown_tenant");
+    erlang_ref tx_ref;
+    if (ei_decode_ref(buf, idx, &tx_ref) != 0)
+        return send_reply_error(req_id, "bad_tx_ref");
+    FDBTransaction *transaction = NULL;
+    fdb_error_t err = fdb_tenant_create_transaction(tenant, &transaction);
+    if (err != 0) return send_reply_fdb_error(req_id, err);
+    erlfdb_tx_t *tx = (erlfdb_tx_t *)malloc(sizeof(erlfdb_tx_t));
+    if (!tx) { fdb_transaction_destroy(transaction); return -1; }
+    tx->transaction    = transaction;
+    tx->txid           = 0;
+    tx->read_only      = 1;
+    tx->writes_allowed = 1;
+    tx->has_watches    = 0;
+    if (erlfdb_registry_put(&tx_registry, &tx_ref, tx, NULL) != 0) {
+        erlfdb_tx_destroy_cb(tx);
+        return send_reply_error(req_id, "registry_alloc_failed");
+    }
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_database_get_main_thread_busyness(long req_id,
+                                                       const char *buf,
+                                                       int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlang_ref db_ref;
+    if (ei_decode_ref(buf, idx, &db_ref) != 0)
+        return send_reply_error(req_id, "bad_db_ref");
+    FDBDatabase *db = (FDBDatabase *)erlfdb_registry_get(&db_registry, &db_ref);
+    if (!db) return send_reply_error(req_id, "unknown_db");
+    double busyness = fdb_database_get_main_thread_busyness(db);
+    return send_reply_ok_double(req_id, busyness);
+}
+
+static int dispatch_database_get_client_status(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 3)
+        return send_reply_error(req_id, "bad_args");
+    erlang_ref db_ref;
+    if (ei_decode_ref(buf, idx, &db_ref) != 0)
+        return send_reply_error(req_id, "bad_db_ref");
+    FDBDatabase *db = (FDBDatabase *)erlfdb_registry_get(&db_registry, &db_ref);
+    if (!db) return send_reply_error(req_id, "unknown_db");
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0)
+        return send_reply_error(req_id, "bad_owner_pid");
+#if FDB_API_VERSION >= 730
+    FDBFuture *future = fdb_database_get_client_status(db);
+    return register_future(req_id, future, ERLFDB_FUT_VALUE, &fut_ref, &owner_pid, 0, NULL);
+#else
+    return send_reply_error(req_id, "not_supported");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Async transaction dispatchers (futures)
+// ---------------------------------------------------------------------------
+
+static int dispatch_transaction_get_read_version(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 3)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0)
+        return send_reply_error(req_id, "bad_owner_pid");
+    FDBFuture *future = fdb_transaction_get_read_version(tx->transaction);
+    return register_future(req_id, future, ERLFDB_FUT_INT64, &fut_ref, &owner_pid, 0, NULL);
+}
+
+// Args: {TxRef, KeySelector, Snapshot, FutRef, OwnerPid}
+static int dispatch_transaction_get_key(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 5)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *key = NULL; int klen = 0; fdb_bool_t or_equal = 0; int offset = 0;
+    if ((r = decode_key_selector(buf, idx, req_id, &key, &klen, &or_equal, &offset)) != 0)
+        return r;
+    char snap_atom[MAXATOMLEN + 1] = {0};
+    if (ei_decode_atom(buf, idx, snap_atom) != 0) {
+        free(key); return send_reply_error(req_id, "bad_snapshot");
+    }
+    int snapshot = strcmp(snap_atom, "true") == 0;
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0) {
+        free(key); return send_reply_error(req_id, "bad_fut_ref");
+    }
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0) {
+        free(key); return send_reply_error(req_id, "bad_owner_pid");
+    }
+    FDBFuture *future = fdb_transaction_get_key(tx->transaction, key, klen,
+                                                 or_equal, offset, snapshot);
+    free(key);
+    return register_future(req_id, future, ERLFDB_FUT_KEY, &fut_ref, &owner_pid, 0, NULL);
+}
+
+// Args: {TxRef, StartKey, EndKey, FutRef, OwnerPid}
+static int dispatch_transaction_get_estimated_range_size(long req_id,
+                                                          const char *buf,
+                                                          int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 5)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *skey = NULL, *ekey = NULL; int slen = 0, elen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &skey, &slen)) != 0) return r;
+    if ((r = decode_binary(buf, idx, req_id, &ekey, &elen)) != 0) { free(skey); return r; }
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_fut_ref");
+    }
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_owner_pid");
+    }
+    FDBFuture *future = fdb_transaction_get_estimated_range_size_bytes(
+        tx->transaction, skey, slen, ekey, elen);
+    free(skey); free(ekey);
+    return register_future(req_id, future, ERLFDB_FUT_INT64, &fut_ref, &owner_pid, 0, NULL);
+}
+
+// Args: {TxRef, Key, FutRef, OwnerPid}
+static int dispatch_transaction_get_addresses_for_key(long req_id,
+                                                       const char *buf,
+                                                       int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 4)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *key = NULL; int klen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &key, &klen)) != 0) return r;
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0) {
+        free(key); return send_reply_error(req_id, "bad_fut_ref");
+    }
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0) {
+        free(key); return send_reply_error(req_id, "bad_owner_pid");
+    }
+    FDBFuture *future = fdb_transaction_get_addresses_for_key(tx->transaction, key, klen);
+    free(key);
+    return register_future(req_id, future, ERLFDB_FUT_STRING_ARRAY,
+                           &fut_ref, &owner_pid, 0, NULL);
+}
+
+// Args: {TxRef, StartKS, EndKS, Limit, TargetBytes, Mode, Iteration, Snapshot, Reverse, FutRef, OwnerPid}
+static int dispatch_transaction_get_range(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 11)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *skey = NULL, *ekey = NULL; int slen = 0, elen = 0;
+    fdb_bool_t sor_eq = 0, eor_eq = 0; int soff = 0, eoff = 0;
+    if ((r = decode_key_selector(buf, idx, req_id, &skey, &slen, &sor_eq, &soff)) != 0)
+        return r;
+    if ((r = decode_key_selector(buf, idx, req_id, &ekey, &elen, &eor_eq, &eoff)) != 0) {
+        free(skey); return r;
+    }
+    long limit = 0, target_bytes = 0, iteration = 0;
+    if (ei_decode_long(buf, idx, &limit) != 0 ||
+        ei_decode_long(buf, idx, &target_bytes) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_limit");
+    }
+    FDBStreamingMode mode;
+    if ((r = decode_streaming_mode(buf, idx, req_id, &mode)) != 0) {
+        free(skey); free(ekey); return r;
+    }
+    if (ei_decode_long(buf, idx, &iteration) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_iteration");
+    }
+    char snap_atom[MAXATOMLEN + 1] = {0}, rev_atom[MAXATOMLEN + 1] = {0};
+    if (ei_decode_atom(buf, idx, snap_atom) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_snapshot");
+    }
+    long reverse = 0;
+    if (ei_decode_long(buf, idx, &reverse) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_reverse");
+    }
+    (void)rev_atom;
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_fut_ref");
+    }
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_owner_pid");
+    }
+    int snapshot = strcmp(snap_atom, "true") == 0;
+    FDBFuture *future = fdb_transaction_get_range(
+        tx->transaction,
+        skey, slen, sor_eq, soff,
+        ekey, elen, eor_eq, eoff,
+        (int)limit, (int)target_bytes, mode, (int)iteration, snapshot, (int)reverse);
+    free(skey); free(ekey);
+    return register_future(req_id, future, ERLFDB_FUT_KEYVALUE_ARRAY,
+                           &fut_ref, &owner_pid, 0, NULL);
+}
+
+// Args: {TxRef, StartKey, EndKey, ChunkSize, FutRef, OwnerPid}
+static int dispatch_transaction_get_range_split_points(long req_id,
+                                                        const char *buf,
+                                                        int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 6)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *skey = NULL, *ekey = NULL; int slen = 0, elen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &skey, &slen)) != 0) return r;
+    if ((r = decode_binary(buf, idx, req_id, &ekey, &elen)) != 0) { free(skey); return r; }
+    long chunk_size = 0;
+    if (ei_decode_long(buf, idx, &chunk_size) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_chunk_size");
+    }
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_fut_ref");
+    }
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0) {
+        free(skey); free(ekey); return send_reply_error(req_id, "bad_owner_pid");
+    }
+    FDBFuture *future = fdb_transaction_get_range_split_points(
+        tx->transaction, skey, slen, ekey, elen, (int64_t)chunk_size);
+    free(skey); free(ekey);
+    return register_future(req_id, future, ERLFDB_FUT_KEY_ARRAY,
+                           &fut_ref, &owner_pid, 0, NULL);
+}
+
+// Args: {TxRef, StartKS, EndKS, Mapper, Limit, TargetBytes, Mode, Iteration, Snapshot, Reverse, FutRef, OwnerPid}
+static int dispatch_transaction_get_mapped_range(long req_id, const char *buf, int *idx) {
+#if FDB_API_VERSION >= 730
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 12)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *skey = NULL, *ekey = NULL; int slen = 0, elen = 0;
+    fdb_bool_t sor_eq = 0, eor_eq = 0; int soff = 0, eoff = 0;
+    if ((r = decode_key_selector(buf, idx, req_id, &skey, &slen, &sor_eq, &soff)) != 0)
+        return r;
+    if ((r = decode_key_selector(buf, idx, req_id, &ekey, &elen, &eor_eq, &eoff)) != 0) {
+        free(skey); return r;
+    }
+    uint8_t *mapper = NULL; int mlen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &mapper, &mlen)) != 0) {
+        free(skey); free(ekey); return r;
+    }
+    long limit = 0, target_bytes = 0, iteration = 0;
+    if (ei_decode_long(buf, idx, &limit) != 0 ||
+        ei_decode_long(buf, idx, &target_bytes) != 0) {
+        free(skey); free(ekey); free(mapper);
+        return send_reply_error(req_id, "bad_limit");
+    }
+    FDBStreamingMode mode;
+    if ((r = decode_streaming_mode(buf, idx, req_id, &mode)) != 0) {
+        free(skey); free(ekey); free(mapper); return r;
+    }
+    if (ei_decode_long(buf, idx, &iteration) != 0) {
+        free(skey); free(ekey); free(mapper);
+        return send_reply_error(req_id, "bad_iteration");
+    }
+    char snap_atom[MAXATOMLEN + 1] = {0};
+    if (ei_decode_atom(buf, idx, snap_atom) != 0) {
+        free(skey); free(ekey); free(mapper);
+        return send_reply_error(req_id, "bad_snapshot");
+    }
+    long reverse = 0;
+    if (ei_decode_long(buf, idx, &reverse) != 0) {
+        free(skey); free(ekey); free(mapper);
+        return send_reply_error(req_id, "bad_reverse");
+    }
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0) {
+        free(skey); free(ekey); free(mapper);
+        return send_reply_error(req_id, "bad_fut_ref");
+    }
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0) {
+        free(skey); free(ekey); free(mapper);
+        return send_reply_error(req_id, "bad_owner_pid");
+    }
+    int snapshot = strcmp(snap_atom, "true") == 0;
+    FDBFuture *future = fdb_transaction_get_mapped_range(
+        tx->transaction,
+        skey, slen, sor_eq, soff,
+        ekey, elen, eor_eq, eoff,
+        mapper, mlen, (int)limit, (int)target_bytes, mode,
+        (int)iteration, snapshot, (int)reverse);
+    free(skey); free(ekey); free(mapper);
+    return register_future(req_id, future, ERLFDB_FUT_MAPPEDKEYVALUE_ARRAY,
+                           &fut_ref, &owner_pid, 0, NULL);
+#else
+    (void)buf; (void)idx;
+    return send_reply_error(req_id, "not_supported");
+#endif
+}
+
+// Args: {TxRef, FutRef, OwnerPid}  — not tx-scoped; fires after commit
+static int dispatch_transaction_get_versionstamp(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 3)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0)
+        return send_reply_error(req_id, "bad_owner_pid");
+    FDBFuture *future = fdb_transaction_get_versionstamp(tx->transaction);
+    return register_future(req_id, future, ERLFDB_FUT_KEY, &fut_ref, &owner_pid, 0, NULL);
+}
+
+// Args: {TxRef, FutRef, OwnerPid}
+static int dispatch_transaction_get_approximate_size(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 3)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0)
+        return send_reply_error(req_id, "bad_owner_pid");
+    FDBFuture *future = fdb_transaction_get_approximate_size(tx->transaction);
+    return register_future(req_id, future, ERLFDB_FUT_INT64, &fut_ref, &owner_pid, 0, NULL);
+}
+
+// Args: {TxRef, ErrorCode, FutRef, OwnerPid}
+static int dispatch_transaction_on_error(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 4)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    long err_code = 0;
+    if (ei_decode_long(buf, idx, &err_code) != 0)
+        return send_reply_error(req_id, "bad_error_code");
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0)
+        return send_reply_error(req_id, "bad_owner_pid");
+    FDBFuture *future = fdb_transaction_on_error(tx->transaction, (fdb_error_t)err_code);
+    return register_future(req_id, future, ERLFDB_FUT_VOID, &fut_ref, &owner_pid, 0, NULL);
+}
+
+// Args: {TxRef, Key, FutRef, OwnerPid}  — not tx-scoped; fires when key changes
+static int dispatch_transaction_watch(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 4)
+        return send_reply_error(req_id, "bad_args");
+    erlfdb_tx_t *tx = NULL;
+    int r = decode_tx(buf, idx, req_id, &tx);
+    if (r != 0 || !tx) return r;
+    uint8_t *key = NULL; int klen = 0;
+    if ((r = decode_binary(buf, idx, req_id, &key, &klen)) != 0) return r;
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0) {
+        free(key); return send_reply_error(req_id, "bad_fut_ref");
+    }
+    erlang_pid owner_pid;
+    if (ei_decode_pid(buf, idx, &owner_pid) != 0) {
+        free(key); return send_reply_error(req_id, "bad_owner_pid");
+    }
+    if (!tx->writes_allowed) {
+        free(key); return send_reply_error(req_id, "writes_not_allowed");
+    }
+    FDBFuture *future = fdb_transaction_watch(tx->transaction, key, klen);
+    free(key);
+    tx->has_watches = 1;
+    return register_future(req_id, future, ERLFDB_FUT_VOID, &fut_ref, &owner_pid, 0, NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Future management dispatchers
+// ---------------------------------------------------------------------------
+
+static int dispatch_future_cancel(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+    erlfdb_future_t *ft =
+        (erlfdb_future_t *)erlfdb_registry_get(&future_registry, &fut_ref);
+    if (!ft) return send_reply_error(req_id, "unknown_future");
+    fdb_future_cancel(ft->future);
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_future_silence(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+    (void)fut_ref;
+    /* No-op: port futures are fire-once. flush_future_message drains the mailbox. */
+    return send_reply_ok(req_id);
+}
+
+static int dispatch_future_is_ready(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+    erlfdb_future_t *ft =
+        (erlfdb_future_t *)erlfdb_registry_get(&future_registry, &fut_ref);
+    if (!ft) return send_reply_ok_long(req_id, 0L);
+    long ready = fdb_future_is_ready(ft->future) ? 1L : 0L;
+    return send_reply_ok_long(req_id, ready);
+}
+
+static int dispatch_future_get_error(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    erlang_ref fut_ref;
+    if (ei_decode_ref(buf, idx, &fut_ref) != 0)
+        return send_reply_error(req_id, "bad_fut_ref");
+    erlfdb_future_t *ft =
+        (erlfdb_future_t *)erlfdb_registry_get(&future_registry, &fut_ref);
+    if (!ft) return send_reply_error(req_id, "unknown_future");
+    fdb_error_t err = fdb_future_get_error(ft->future);
+    return (err != 0) ? send_reply_fdb_error(req_id, err) : send_reply_ok(req_id);
+}
+
+// ---------------------------------------------------------------------------
+// Misc: get_error, error_predicate
+// ---------------------------------------------------------------------------
+
+static int dispatch_get_error(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 1)
+        return send_reply_error(req_id, "bad_args");
+    long code = 0;
+    if (ei_decode_long(buf, idx, &code) != 0)
+        return send_reply_error(req_id, "bad_code");
+    const char *msg = fdb_get_error((fdb_error_t)code);
+    return send_reply_ok_binary(req_id, (const uint8_t *)msg, (int)strlen(msg));
+}
+
+static int dispatch_error_predicate(long req_id, const char *buf, int *idx) {
+    int arity = 0;
+    if (ei_decode_tuple_header(buf, idx, &arity) != 0 || arity != 2)
+        return send_reply_error(req_id, "bad_args");
+    char pred_name[MAXATOMLEN + 1] = {0};
+    if (ei_decode_atom(buf, idx, pred_name) != 0)
+        return send_reply_error(req_id, "bad_predicate");
+    long code = 0;
+    if (ei_decode_long(buf, idx, &code) != 0)
+        return send_reply_error(req_id, "bad_code");
+    FDBErrorPredicate pred;
+    if      (strcmp(pred_name, "retryable")              == 0) pred = FDB_ERROR_PREDICATE_RETRYABLE;
+    else if (strcmp(pred_name, "maybe_committed")        == 0) pred = FDB_ERROR_PREDICATE_MAYBE_COMMITTED;
+    else if (strcmp(pred_name, "retryable_not_committed")== 0) pred = FDB_ERROR_PREDICATE_RETRYABLE_NOT_COMMITTED;
+    else return send_reply_error(req_id, "unknown_predicate");
+    int result = fdb_error_predicate(pred, (fdb_error_t)code);
+    return send_reply_ok_long(req_id, (long)result);
+}
+
+// ---------------------------------------------------------------------------
 // Request dispatcher
 // ---------------------------------------------------------------------------
 
@@ -1189,6 +2020,50 @@ static int handle_request(const uint8_t *buf, uint32_t len) {
         return dispatch_transaction_commit(req_id, (const char *)buf, &idx);
     } else if (strcmp(op, "future_get") == 0) {
         return dispatch_future_get(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "database_set_option") == 0) {
+        return dispatch_database_set_option(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "database_open_tenant") == 0) {
+        return dispatch_database_open_tenant(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "tenant_create_transaction") == 0) {
+        return dispatch_tenant_create_transaction(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "database_get_main_thread_busyness") == 0) {
+        return dispatch_database_get_main_thread_busyness(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "database_get_client_status") == 0) {
+        return dispatch_database_get_client_status(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_read_version") == 0) {
+        return dispatch_transaction_get_read_version(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_key") == 0) {
+        return dispatch_transaction_get_key(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_estimated_range_size") == 0) {
+        return dispatch_transaction_get_estimated_range_size(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_addresses_for_key") == 0) {
+        return dispatch_transaction_get_addresses_for_key(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_range") == 0) {
+        return dispatch_transaction_get_range(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_range_split_points") == 0) {
+        return dispatch_transaction_get_range_split_points(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_mapped_range") == 0) {
+        return dispatch_transaction_get_mapped_range(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_versionstamp") == 0) {
+        return dispatch_transaction_get_versionstamp(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_get_approximate_size") == 0) {
+        return dispatch_transaction_get_approximate_size(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_on_error") == 0) {
+        return dispatch_transaction_on_error(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "transaction_watch") == 0) {
+        return dispatch_transaction_watch(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "future_cancel") == 0) {
+        return dispatch_future_cancel(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "future_silence") == 0) {
+        return dispatch_future_silence(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "future_is_ready") == 0) {
+        return dispatch_future_is_ready(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "future_get_error") == 0) {
+        return dispatch_future_get_error(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "get_error") == 0) {
+        return dispatch_get_error(req_id, (const char *)buf, &idx);
+    } else if (strcmp(op, "error_predicate") == 0) {
+        return dispatch_error_predicate(req_id, (const char *)buf, &idx);
     }
 
     return send_reply_error(req_id, "unknown_op");

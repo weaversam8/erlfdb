@@ -67,7 +67,7 @@ init([WorkerIx]) ->
             InitArgs =
                 case application:get_env(erlfdb, init_request_args) of
                     {ok, Args} -> Args;
-                    undefined -> {erlfdb_nif:get_default_api_version(), []}
+                    undefined -> {erlfdb_port:get_default_api_version(), []}
                 end,
             case run_init_handshake(Port, InitArgs, ?INIT_TIMEOUT_MS) of
                 ok ->

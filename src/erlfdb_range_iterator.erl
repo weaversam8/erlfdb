@@ -192,7 +192,7 @@ send_get_range(State = #state{mapper = undefined}) ->
         snapshot = Snapshot,
         reverse = Reverse
     } = State,
-    Future = erlfdb_nif:transaction_get_range(
+    Future = (tx_mod(Tx)):transaction_get_range(
         Tx,
         StartKey,
         EndKey,
@@ -216,7 +216,7 @@ send_get_range(State = #state{mapper = Mapper}) ->
         snapshot = Snapshot,
         reverse = Reverse
     } = State,
-    Future = erlfdb_nif:transaction_get_mapped_range(
+    Future = (tx_mod(Tx)):transaction_get_mapped_range(
         Tx,
         StartKey,
         EndKey,
@@ -229,6 +229,9 @@ send_get_range(State = #state{mapper = Mapper}) ->
         Reverse
     ),
     State#state{future = Future}.
+
+tx_mod({erlfdb_transaction, _, _}) -> erlfdb_port;
+tx_mod(_) -> erlfdb_nif.
 
 get_last_key(Rows, _State = #state{mapper = undefined}) ->
     {K, _V} = lists:last(Rows),

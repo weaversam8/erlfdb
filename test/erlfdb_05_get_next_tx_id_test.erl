@@ -14,7 +14,18 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-get_tx_id_test() ->
+-define(BACKENDS, [erlfdb_nif, erlfdb_port]).
+
+backends_test_() ->
+    Tests = [fun t_get_tx_id/0],
+    [{atom_to_list(B),
+      {setup,
+       fun() -> application:set_env(erlfdb, backend, B) end,
+       fun(_) -> application:set_env(erlfdb, backend, erlfdb_port) end,
+       Tests}}
+     || B <- ?BACKENDS].
+
+t_get_tx_id() ->
     Db = erlfdb_sandbox:open(),
     erlfdb:transactional(Db, fun(Tx) ->
         lists:foreach(

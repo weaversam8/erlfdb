@@ -243,12 +243,31 @@ iex> :erlfdb.transactional(db, fn tx ->
 
 -define(IS_FUTURE, {erlfdb_future, _, _}).
 -define(IS_FOLD_FUTURE, {fold_future, _, _}).
--define(IS_DB, {erlfdb_database, _}).
--define(IS_TENANT, {erlfdb_tenant, _}).
--define(IS_TX, {erlfdb_transaction, _}).
+-define(IS_DB, {erlfdb_database, _, _}).
+-define(IS_TENANT, {erlfdb_tenant, _, _}).
+-define(IS_TX, {erlfdb_transaction, _, _}).
 -define(IS_SS, {erlfdb_snapshot, _}).
 -define(GET_TX(SS), element(2, SS)).
 -define(ERLFDB_ERROR, '$erlfdb_error').
+
+%% NIF handle patterns (2-tuple shapes)
+-define(IS_NIF_DB, {erlfdb_database, _}).
+-define(IS_NIF_TENANT, {erlfdb_tenant, _}).
+-define(IS_NIF_TX, {erlfdb_transaction, _}).
+-define(IS_NIF_FUTURE, {erlfdb_future, _, _}).
+
+%% Returns the configured backend; used by handle-creation functions.
+backend() ->
+    application:get_env(erlfdb, backend, erlfdb_port).
+
+%% Returns erlfdb_nif or erlfdb_port based on the transaction handle shape.
+tx_mod({erlfdb_transaction, W, _}) when is_pid(W) -> erlfdb_port;
+tx_mod(_) -> erlfdb_nif.
+
+%% Returns erlfdb_nif or erlfdb_port based on the future handle.
+%% NIF futures have a reference at element 2; port futures have a pid.
+fut_mod({erlfdb_future, W, _}) when is_pid(W) -> erlfdb_port;
+fut_mod(_) -> erlfdb_nif.
 
 -record(fold_st, {
     start_key,
@@ -269,13 +288,18 @@ iex> :erlfdb.transactional(db, fn tx ->
     future
 }).
 
--type atomic_mode() :: erlfdb_nif:atomic_mode().
--type atomic_operand() :: erlfdb_nif:atomic_operand().
+%% Handle types are unions of the NIF (2-tuple) and port (3-tuple) shapes.
+-type database()    :: erlfdb_nif:database()    | erlfdb_port:database().
+-type tenant()      :: erlfdb_nif:tenant()      | erlfdb_port:tenant().
+-type transaction() :: erlfdb_nif:transaction() | erlfdb_port:transaction().
+-type future()      :: erlfdb_nif:future()      | erlfdb_port:future().
+
+-type atomic_mode()     :: erlfdb_port:atomic_mode().
+-type atomic_operand()  :: erlfdb_port:atomic_operand().
 -type cluster_filename() :: binary().
--type database() :: erlfdb_nif:database().
--type database_option() :: erlfdb_nif:database_option().
--type error() :: erlfdb_nif:error().
--type error_predicate() :: erlfdb_nif:error_predicate().
+-type database_option() :: erlfdb_port:database_option().
+-type error()           :: erlfdb_port:error().
+-type error_predicate() :: erlfdb_port:error_predicate().
 -type fold_future() :: #fold_future{}.
 -type fold_option() ::
     {reverse, boolean() | integer()}
@@ -288,25 +312,22 @@ iex> :erlfdb.transactional(db, fn tx ->
     | {wait, true | false | interleaving}.
 -type split_option() ::
     {chunk_size, non_neg_integer()}.
--type future() :: erlfdb_nif:future().
 -type future_ready_message() :: transaction_future_ready_message() | watch_future_ready_message().
 -type get_versionstamp_option() ::
     {to, pid()}.
--type key() :: erlfdb_nif:key().
--type kv() :: {key(), value()}.
--type key_selector() :: erlfdb_nif:key_selector().
+-type key()       :: erlfdb_port:key().
+-type kv()        :: {key(), value()}.
+-type key_selector() :: erlfdb_port:key_selector().
 -type open_option() :: {dist, scheduler_id | cluster_file}.
--type result() :: erlfdb_nif:future_result().
+-type result()    :: erlfdb_port:future_result().
 -type mapped_kv() :: {kv(), {key(), key()}, list(kv())}.
--type mapper() :: tuple().
--type snapshot() :: {erlfdb_snapshot, transaction()}.
--type tenant() :: erlfdb_nif:tenant().
+-type mapper()    :: tuple().
+-type snapshot()  :: {erlfdb_snapshot, transaction()}.
 -type tenant_name() :: binary().
--type transaction() :: erlfdb_nif:transaction().
 -type transaction_future_ready_message() :: {{reference(), reference()}, ready}.
--type transaction_option() :: erlfdb_nif:transaction_option().
--type value() :: erlfdb_nif:value().
--type version() :: erlfdb_nif:version().
+-type transaction_option() :: erlfdb_port:transaction_option().
+-type value() :: erlfdb_port:value().
+-type version() :: erlfdb_port:version().
 -type wait_option() :: {timeout, non_neg_integer() | infinity} | {with_index, boolean()}.
 -type watch_future_ready_message() :: {reference(), ready}.
 -type watch_option() ::
@@ -365,15 +386,12 @@ your own, use `create_database/1` directly instead.
 -endif.
 -spec open(cluster_filename(), list(open_option())) -> database().
 open(ClusterFile, Options) ->
-    Key =
-        case proplists:get_value(dist, Options, scheduler_id) of
-            scheduler_id ->
-                Sid = erlang:system_info(scheduler_id),
-                open_dist_key(scheduler_id, {ClusterFile, Sid});
-            cluster_file ->
-                open_dist_key(cluster_file, ClusterFile)
-        end,
-    open_with_key(Key, ClusterFile).
+    open_(backend(), ClusterFile, Options).
+
+open_(erlfdb_nif, ClusterFile, _Options) ->
+    erlfdb_nif:create_database(ClusterFile);
+open_(erlfdb_port, ClusterFile, Options) ->
+    erlfdb_worker_pool:open(ClusterFile, Options).
 
 -if(?DOCATTRS).
 -doc """
@@ -411,15 +429,20 @@ during your application start-up will ensure that you are in compliance with the
 -endif.
 -spec open_all(cluster_filename(), list(open_option())) -> list(database()).
 open_all(ClusterFile, Options) ->
-    Keys =
-        case proplists:get_value(dist, Options, scheduler_id) of
-            scheduler_id ->
-                N = erlang:system_info(schedulers_online),
-                [open_dist_key(scheduler_id, {ClusterFile, Sid}) || Sid <- lists:seq(1, N)];
-            cluster_file ->
-                [open_dist_key(cluster_file, ClusterFile)]
-        end,
-    [open_with_key(Key, ClusterFile) || Key <- Keys].
+    open_all_(backend(), ClusterFile, Options).
+
+open_all_(erlfdb_nif, ClusterFile, _Options) ->
+    N = erlang:system_info(schedulers_online),
+    [erlfdb_nif:create_database(ClusterFile) || _ <- lists:seq(1, N)];
+open_all_(erlfdb_port, ClusterFile, Options) ->
+    case proplists:get_value(dist, Options, scheduler_id) of
+        scheduler_id ->
+            N = erlang:system_info(schedulers_online),
+            [erlfdb_worker_pool:open_for_scheduler(ClusterFile, Options, Sid)
+             || Sid <- lists:seq(1, N)];
+        cluster_file ->
+            [erlfdb_worker_pool:open(ClusterFile, Options)]
+    end.
 
 -if(?DOCATTRS).
 -doc """
@@ -430,7 +453,14 @@ Opens a handle to the [Tenant](https://apple.github.io/foundationdb/tenants.html
 -endif.
 -spec open_tenant(database(), tenant_name()) -> tenant().
 open_tenant(?IS_DB = Db, TenantName) ->
-    erlfdb_nif:database_open_tenant(Db, TenantName).
+    open_tenant_(erlfdb_port, Db, TenantName);
+open_tenant(?IS_NIF_DB = NifDb, TenantName) ->
+    open_tenant_(erlfdb_nif, NifDb, TenantName).
+
+open_tenant_(erlfdb_nif, Db, TenantName) ->
+    erlfdb_nif:database_open_tenant(Db, TenantName);
+open_tenant_(erlfdb_port, Db, TenantName) ->
+    erlfdb_port:database_open_tenant(Db, TenantName).
 
 -if(?DOCATTRS).
 -doc """
@@ -452,7 +482,12 @@ Creates a database object, which serves as a handle to the FoundationDB server, 
 -endif.
 -spec create_database(cluster_filename()) -> database().
 create_database(ClusterFile) ->
-    erlfdb_nif:create_database(ClusterFile).
+    create_database_(backend(), ClusterFile).
+
+create_database_(erlfdb_nif, ClusterFile) ->
+    erlfdb_nif:create_database(ClusterFile);
+create_database_(erlfdb_port, ClusterFile) ->
+    erlfdb_port:create_database(ClusterFile).
 
 -if(?DOCATTRS).
 -doc """
@@ -470,7 +505,14 @@ The caller is responsible for calling
 -endif.
 -spec create_transaction(database()) -> transaction().
 create_transaction(?IS_DB = Db) ->
-    erlfdb_nif:database_create_transaction(Db).
+    create_transaction_(erlfdb_port, Db);
+create_transaction(?IS_NIF_DB = NifDb) ->
+    create_transaction_(erlfdb_nif, NifDb).
+
+create_transaction_(erlfdb_nif, Db) ->
+    erlfdb_nif:database_create_transaction(Db);
+create_transaction_(erlfdb_port, Db) ->
+    erlfdb_port:database_create_transaction(Db).
 
 -if(?DOCATTRS).
 -doc """
@@ -488,7 +530,14 @@ The caller is responsible for calling
 -endif.
 -spec tenant_create_transaction(tenant()) -> transaction().
 tenant_create_transaction(?IS_TENANT = Tenant) ->
-    erlfdb_nif:tenant_create_transaction(Tenant).
+    tenant_create_transaction_(erlfdb_port, Tenant);
+tenant_create_transaction(?IS_NIF_TENANT = NifTenant) ->
+    tenant_create_transaction_(erlfdb_nif, NifTenant).
+
+tenant_create_transaction_(erlfdb_nif, Tenant) ->
+    erlfdb_nif:tenant_create_transaction(Tenant);
+tenant_create_transaction_(erlfdb_port, Tenant) ->
+    erlfdb_port:tenant_create_transaction(Tenant).
 
 -if(?DOCATTRS).
 -doc """
@@ -574,17 +623,32 @@ Performing non-trivial logic inside a transaction:
 -endif.
 -spec transactional(database() | tenant() | transaction() | snapshot(), function()) -> any().
 transactional(?IS_DB = Db, UserFun) when is_function(UserFun, 1) ->
-    clear_erlfdb_error(),
-    Tx = create_transaction(Db),
-    do_transaction(Tx, UserFun, 0);
+    transactional_(erlfdb_port, Db, UserFun);
+transactional(?IS_NIF_DB = Db, UserFun) when is_function(UserFun, 1) ->
+    transactional_(erlfdb_nif, Db, UserFun);
 transactional(?IS_TENANT = Tenant, UserFun) when is_function(UserFun, 1) ->
+    clear_erlfdb_error(),
+    Tx = tenant_create_transaction(Tenant),
+    do_transaction(Tx, UserFun, 0);
+transactional(?IS_NIF_TENANT = Tenant, UserFun) when is_function(UserFun, 1) ->
     clear_erlfdb_error(),
     Tx = tenant_create_transaction(Tenant),
     do_transaction(Tx, UserFun, 0);
 transactional(?IS_TX = Tx, UserFun) when is_function(UserFun, 1) ->
     UserFun(Tx);
+transactional(?IS_NIF_TX = Tx, UserFun) when is_function(UserFun, 1) ->
+    UserFun(Tx);
 transactional(?IS_SS = SS, UserFun) when is_function(UserFun, 1) ->
     UserFun(SS).
+
+transactional_(erlfdb_nif, Db, UserFun) ->
+    clear_erlfdb_error(),
+    Tx = create_transaction(Db),
+    do_transaction(Tx, UserFun, 0);
+transactional_(erlfdb_port, Db, UserFun) ->
+    clear_erlfdb_error(),
+    Tx = create_transaction(Db),
+    do_transaction(Tx, UserFun, 0).
 
 -if(?DOCATTRS).
 -doc """
@@ -606,6 +670,8 @@ performed as [Snapshot Reads](https://apple.github.io/foundationdb/developer-gui
 -endif.
 -spec snapshot(transaction() | snapshot()) -> snapshot().
 snapshot(?IS_TX = Tx) ->
+    {erlfdb_snapshot, Tx};
+snapshot(?IS_NIF_TX = Tx) ->
     {erlfdb_snapshot, Tx};
 snapshot(?IS_SS = SS) ->
     SS.
@@ -632,9 +698,22 @@ Sets a valued option on a database or transaction.
 -spec set_option(database() | transaction(), database_option() | transaction_option(), binary()) ->
     ok.
 set_option(?IS_DB = Db, DbOption, Value) ->
-    erlfdb_nif:database_set_option(Db, DbOption, Value);
+    set_option_(erlfdb_port, Db, DbOption, Value);
+set_option(?IS_NIF_DB = NifDb, DbOption, Value) ->
+    set_option_(erlfdb_nif, NifDb, DbOption, Value);
 set_option(?IS_TX = Tx, TxOption, Value) ->
-    erlfdb_nif:transaction_set_option(Tx, TxOption, Value).
+    set_option_(erlfdb_port, Tx, TxOption, Value);
+set_option(?IS_NIF_TX = NifTx, TxOption, Value) ->
+    set_option_(erlfdb_nif, NifTx, TxOption, Value).
+
+set_option_(erlfdb_nif, ?IS_NIF_DB = Db, Opt, Val) ->
+    erlfdb_nif:database_set_option(Db, Opt, Val);
+set_option_(erlfdb_nif, ?IS_NIF_TX = Tx, Opt, Val) ->
+    erlfdb_nif:transaction_set_option(Tx, Opt, Val);
+set_option_(erlfdb_port, {erlfdb_database, _, _} = Db, Opt, Val) ->
+    erlfdb_port:database_set_option(Db, Opt, Val);
+set_option_(erlfdb_port, {erlfdb_transaction, _, _} = Tx, Opt, Val) ->
+    erlfdb_port:transaction_set_option(Tx, Opt, Val).
 
 -if(?DOCATTRS).
 -doc """
@@ -649,7 +728,14 @@ Commits a transaction.
 -endif.
 -spec commit(transaction()) -> future().
 commit(?IS_TX = Tx) ->
-    erlfdb_nif:transaction_commit(Tx).
+    commit_(erlfdb_port, Tx);
+commit(?IS_NIF_TX = NifTx) ->
+    commit_(erlfdb_nif, NifTx).
+
+commit_(erlfdb_nif, Tx) ->
+    erlfdb_nif:transaction_commit(Tx);
+commit_(erlfdb_port, Tx) ->
+    erlfdb_port:transaction_commit(Tx).
 
 -if(?DOCATTRS).
 -doc """
@@ -664,7 +750,14 @@ Resets a transaction.
 -endif.
 -spec reset(transaction()) -> ok.
 reset(?IS_TX = Tx) ->
-    ok = erlfdb_nif:transaction_reset(Tx).
+    reset_(erlfdb_port, Tx);
+reset(?IS_NIF_TX = NifTx) ->
+    reset_(erlfdb_nif, NifTx).
+
+reset_(erlfdb_nif, Tx) ->
+    ok = erlfdb_nif:transaction_reset(Tx);
+reset_(erlfdb_port, Tx) ->
+    ok = erlfdb_port:transaction_reset(Tx).
 
 -if(?DOCATTRS).
 -doc """
@@ -682,7 +775,14 @@ cancel(?IS_FOLD_FUTURE = FoldInfo) ->
 cancel(?IS_FUTURE = Future) ->
     cancel(Future, []);
 cancel(?IS_TX = Tx) ->
-    ok = erlfdb_nif:transaction_cancel(Tx).
+    cancel_(erlfdb_port, Tx);
+cancel(?IS_NIF_TX = NifTx) ->
+    cancel_(erlfdb_nif, NifTx).
+
+cancel_(erlfdb_nif, Tx) ->
+    ok = erlfdb_nif:transaction_cancel(Tx);
+cancel_(erlfdb_port, Tx) ->
+    ok = erlfdb_port:transaction_cancel(Tx).
 
 -if(?DOCATTRS).
 -doc """
@@ -702,11 +802,16 @@ cancel(?IS_FOLD_FUTURE = FoldInfo, Options) ->
     #fold_future{future = Future} = FoldInfo,
     cancel(Future, Options);
 cancel(?IS_FUTURE = Future, Options) ->
-    ok = erlfdb_nif:future_cancel(Future),
+    future_cancel_(fut_mod(Future), Future),
     case erlfdb_util:get(Options, flush, false) of
         true -> flush_future_message(Future);
         false -> ok
     end.
+
+future_cancel_(erlfdb_nif, Future) ->
+    ok = erlfdb_nif:future_cancel(Future);
+future_cancel_(erlfdb_port, Future) ->
+    ok = erlfdb_port:future_cancel(Future).
 
 -if(?DOCATTRS).
 -doc """
@@ -722,7 +827,12 @@ immediately.
 -endif.
 -spec is_ready(future()) -> boolean().
 is_ready(?IS_FUTURE = Future) ->
-    erlfdb_nif:future_is_ready(Future).
+    is_ready_(fut_mod(Future), Future).
+
+is_ready_(erlfdb_nif, Future) ->
+    erlfdb_nif:future_is_ready(Future);
+is_ready_(erlfdb_port, Future) ->
+    erlfdb_port:future_is_ready(Future).
 
 -if(?DOCATTRS).
 -doc """
@@ -737,7 +847,12 @@ Returns `ok` if future is ready and not in an error state, and an `t:error/0` ot
 -endif.
 -spec get_error(future()) -> ok | error().
 get_error(?IS_FUTURE = Future) ->
-    erlfdb_nif:future_get_error(Future).
+    get_error_(fut_mod(Future), Future).
+
+get_error_(erlfdb_nif, Future) ->
+    erlfdb_nif:future_get_error(Future);
+get_error_(erlfdb_port, Future) ->
+    erlfdb_port:future_get_error(Future).
 
 -if(?DOCATTRS).
 -doc """
@@ -752,7 +867,12 @@ Returns the result of a ready future.
 -endif.
 -spec get(future()) -> result().
 get(?IS_FUTURE = Future) ->
-    erlfdb_nif:future_get(Future).
+    future_get_(fut_mod(Future), Future).
+
+future_get_(erlfdb_nif, Future) ->
+    erlfdb_nif:future_get(Future);
+future_get_(erlfdb_port, Future) ->
+    erlfdb_port:future_get(Future).
 
 -if(?DOCATTRS).
 -doc """
@@ -767,7 +887,16 @@ Blocks the calling process until the future is ready.
 -endif.
 -spec block_until_ready(future()) -> ok.
 block_until_ready(?IS_FUTURE = Future) ->
-    {erlfdb_future, MsgRef, _FRef} = Future,
+    block_until_ready_(fut_mod(Future), Future).
+
+block_until_ready_(erlfdb_nif, Future) ->
+    {erlfdb_future, MsgRef, _} = Future,
+    receive
+        {MsgRef, ready} -> ok;
+        {{_TxRef, MsgRef}, ready} -> ok
+    end;
+block_until_ready_(erlfdb_port, Future) ->
+    {erlfdb_future, _Worker, MsgRef} = Future,
     receive
         {MsgRef, ready} -> ok;
         {{_TxRef, MsgRef}, ready} -> ok
@@ -804,24 +933,42 @@ If first argument is not a future, then simply return the first argument.
 -endif.
 -spec wait(future() | result(), [wait_option()]) -> result().
 wait(?IS_FUTURE = Future, Options) ->
-    case is_ready(Future) of
+    wait_(fut_mod(Future), Future, Options);
+wait(Ready, _) ->
+    Ready.
+
+wait_(erlfdb_nif, Future, Options) ->
+    case is_ready_(erlfdb_nif, Future) of
         true ->
-            Result = get(Future),
-            % Flush ready message if already sent
+            Result = future_get_(erlfdb_nif, Future),
             flush_future_message(Future),
             Result;
         false ->
             Timeout = erlfdb_util:get(Options, timeout, infinity),
-            {erlfdb_future, MsgRef, _Res} = Future,
+            {erlfdb_future, MsgRef, _} = Future,
             receive
-                {MsgRef, ready} -> get(Future);
-                {{_TxRef, MsgRef}, ready} -> get(Future)
+                {MsgRef, ready} -> future_get_(erlfdb_nif, Future);
+                {{_TxRef, MsgRef}, ready} -> future_get_(erlfdb_nif, Future)
             after Timeout ->
                 erlang:error({timeout, Future})
             end
     end;
-wait(Ready, _) ->
-    Ready.
+wait_(erlfdb_port, Future, Options) ->
+    case is_ready_(erlfdb_port, Future) of
+        true ->
+            Result = future_get_(erlfdb_port, Future),
+            flush_future_message(Future),
+            Result;
+        false ->
+            Timeout = erlfdb_util:get(Options, timeout, infinity),
+            {erlfdb_future, _Worker, MsgRef} = Future,
+            receive
+                {MsgRef, ready} -> future_get_(erlfdb_port, Future);
+                {{_TxRef, MsgRef}, ready} -> future_get_(erlfdb_port, Future)
+            after Timeout ->
+                erlang:error({timeout, Future})
+            end
+    end.
 
 -if(?DOCATTRS).
 -doc """
@@ -863,7 +1010,7 @@ wait_for_any(Futures, Options, ResendQ) ->
     Timeout = erlfdb_util:get(Options, timeout, infinity),
     receive
         {FutureKey, ready} = Msg when is_reference(FutureKey) orelse is_tuple(FutureKey) ->
-            case lists:keyfind(FutureKey, 2, Futures) of
+            case lists:keyfind(FutureKey, 3, Futures) of
                 ?IS_FUTURE = Future ->
                     lists:foreach(
                         fun(M) ->
@@ -1037,10 +1184,21 @@ get(?IS_DB = Db, Key) ->
     transactional(Db, fun(Tx) ->
         wait(get(Tx, Key))
     end);
+get(?IS_NIF_DB = NifDb, Key) ->
+    transactional(NifDb, fun(Tx) ->
+        wait(get(Tx, Key))
+    end);
 get(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_get(Tx, Key, false);
+    get_tx_(erlfdb_port, Tx, Key, false);
+get(?IS_NIF_TX = NifTx, Key) ->
+    get_tx_(erlfdb_nif, NifTx, Key, false);
 get(?IS_SS = SS, Key) ->
-    get_ss(?GET_TX(SS), Key).
+    get_tx_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), Key, true).
+
+get_tx_(erlfdb_nif, Tx, Key, Snapshot) ->
+    erlfdb_nif:transaction_get(Tx, Key, Snapshot);
+get_tx_(erlfdb_port, Tx, Key, Snapshot) ->
+    erlfdb_port:transaction_get(Tx, Key, Snapshot).
 
 -if(?DOCATTRS).
 -doc """
@@ -1051,9 +1209,11 @@ With snapshot isolation, gets a value from the database.
 -endif.
 -spec get_ss(transaction() | snapshot(), key()) -> future().
 get_ss(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_get(Tx, Key, true);
+    get_tx_(erlfdb_port, Tx, Key, true);
+get_ss(?IS_NIF_TX = NifTx, Key) ->
+    get_tx_(erlfdb_nif, NifTx, Key, true);
 get_ss(?IS_SS = SS, Key) ->
-    get_ss(?GET_TX(SS), Key).
+    get_tx_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), Key, true).
 
 -if(?DOCATTRS).
 -doc """
@@ -1067,10 +1227,21 @@ get_key(?IS_DB = Db, Key) ->
     transactional(Db, fun(Tx) ->
         wait(get_key(Tx, Key))
     end);
+get_key(?IS_NIF_DB = NifDb, Key) ->
+    transactional(NifDb, fun(Tx) ->
+        wait(get_key(Tx, Key))
+    end);
 get_key(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_get_key(Tx, Key, false);
+    get_key_tx_(erlfdb_port, Tx, Key, false);
+get_key(?IS_NIF_TX = NifTx, Key) ->
+    get_key_tx_(erlfdb_nif, NifTx, Key, false);
 get_key(?IS_SS = SS, Key) ->
-    get_key_ss(?GET_TX(SS), Key).
+    get_key_tx_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), Key, true).
+
+get_key_tx_(erlfdb_nif, Tx, Key, Snapshot) ->
+    erlfdb_nif:transaction_get_key(Tx, Key, Snapshot);
+get_key_tx_(erlfdb_port, Tx, Key, Snapshot) ->
+    erlfdb_port:transaction_get_key(Tx, Key, Snapshot).
 
 -if(?DOCATTRS).
 -doc """
@@ -1081,7 +1252,9 @@ With snapshot isolation, resolves a `t:key_selector/0` against the keys in the d
 -endif.
 -spec get_key_ss(transaction(), key_selector()) -> future() | key().
 get_key_ss(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_get_key(Tx, Key, true).
+    get_key_tx_(erlfdb_port, Tx, Key, true);
+get_key_ss(?IS_NIF_TX = NifTx, Key) ->
+    get_key_tx_(erlfdb_nif, NifTx, Key, true).
 
 -if(?DOCATTRS).
 -doc """
@@ -1145,6 +1318,25 @@ get_range(?IS_DB = Db, StartKey, EndKey, Options) ->
     transactional(Db, fun(Tx) ->
         get_range(Tx, StartKey, EndKey, Options)
     end);
+get_range(?IS_NIF_DB = NifDb, StartKey, EndKey, Options) ->
+    transactional(NifDb, fun(Tx) ->
+        get_range(Tx, StartKey, EndKey, Options)
+    end);
+get_range(?IS_NIF_TX = NifTx, StartKey, EndKey, Options) ->
+    case erlfdb_util:get(Options, wait, true) of
+        true ->
+            Fun = fun(Rows, Acc) -> [Rows | Acc] end,
+            Chunks = folding_get_range_and_wait(NifTx, StartKey, EndKey, Fun, [], Options),
+            lists:flatten(lists:reverse(Chunks));
+        false ->
+            fold_range_future(NifTx, StartKey, EndKey, Options);
+        interleaving ->
+            SplitPoints = erlfdb:wait(get_range_split_points(NifTx, StartKey, EndKey, Options)),
+            Ranges = erlfdb_key:list_to_ranges(SplitPoints),
+            Futures = [fold_range_future(NifTx, SK, EK, Options) || {SK, EK} <- Ranges],
+            Result = wait_for_all_interleaving(NifTx, Futures),
+            lists:flatten(Result)
+    end;
 get_range(?IS_TX = Tx, StartKey, EndKey, Options) ->
     case erlfdb_util:get(Options, wait, true) of
         true ->
@@ -1288,10 +1480,22 @@ get_range_split_points(?IS_DB = Db, StartKey, EndKey, Options) ->
         Future = get_range_split_points(Tx, StartKey, EndKey, Options),
         wait(Future)
     end);
+get_range_split_points(?IS_NIF_DB = NifDb, StartKey, EndKey, Options) ->
+    transactional(NifDb, fun(Tx) ->
+        Future = get_range_split_points(Tx, StartKey, EndKey, Options),
+        wait(Future)
+    end);
 get_range_split_points(?IS_TX = Tx, StartKey, EndKey, Options) ->
-    % 10M
     ChunkSize = erlfdb_util:get(Options, chunk_size, 10000000),
-    erlfdb_nif:transaction_get_range_split_points(Tx, StartKey, EndKey, ChunkSize).
+    get_range_split_points_(erlfdb_port, Tx, StartKey, EndKey, ChunkSize);
+get_range_split_points(?IS_NIF_TX = NifTx, StartKey, EndKey, Options) ->
+    ChunkSize = erlfdb_util:get(Options, chunk_size, 10000000),
+    get_range_split_points_(erlfdb_nif, NifTx, StartKey, EndKey, ChunkSize).
+
+get_range_split_points_(erlfdb_nif, Tx, StartKey, EndKey, ChunkSize) ->
+    erlfdb_nif:transaction_get_range_split_points(Tx, StartKey, EndKey, ChunkSize);
+get_range_split_points_(erlfdb_port, Tx, StartKey, EndKey, ChunkSize) ->
+    erlfdb_port:transaction_get_range_split_points(Tx, StartKey, EndKey, ChunkSize).
 
 -if(?DOCATTRS).
 -doc """
@@ -1317,6 +1521,16 @@ fold_range(?IS_DB = Db, StartKey, EndKey, Fun, Acc, Options) ->
     transactional(Db, fun(Tx) ->
         fold_range(Tx, StartKey, EndKey, Fun, Acc, Options)
     end);
+fold_range(?IS_NIF_DB = NifDb, StartKey, EndKey, Fun, Acc, Options) ->
+    transactional(NifDb, fun(Tx) ->
+        fold_range(Tx, StartKey, EndKey, Fun, Acc, Options)
+    end);
+fold_range(?IS_NIF_TX = NifTx, StartKey, EndKey, Fun, Acc, Options) ->
+    folding_get_range_and_wait(
+        NifTx, StartKey, EndKey,
+        fun(Rows, InnerAcc) -> lists:foldl(Fun, InnerAcc, Rows) end,
+        Acc, Options
+    );
 fold_range(?IS_TX = Tx, StartKey, EndKey, Fun, Acc, Options) ->
     folding_get_range_and_wait(
         Tx,
@@ -1345,6 +1559,9 @@ Deprecated. Gets a `t:fold_future/0` from a key range.
 fold_range_future(?IS_TX = Tx, StartKey, EndKey, Options) ->
     St = options_to_fold_st(StartKey, EndKey, Options),
     folding_get_future(Tx, St);
+fold_range_future(?IS_NIF_TX = NifTx, StartKey, EndKey, Options) ->
+    St = options_to_fold_st(StartKey, EndKey, Options),
+    folding_get_future(NifTx, St);
 fold_range_future(?IS_SS = SS, StartKey, EndKey, Options) ->
     SSOptions = [{snapshot, true} | Options],
     fold_range_future(?GET_TX(SS), StartKey, EndKey, SSOptions).
@@ -1399,6 +1616,8 @@ Retrieves results from a `t:fold_future/0`. Executes a reducing function as the 
     any().
 fold_range_wait(?IS_TX = Tx, ?IS_FOLD_FUTURE = FF, Fun, Acc, Options) ->
     wait_and_apply(Tx, [FF], Fun, Acc, Options);
+fold_range_wait(?IS_NIF_TX = NifTx, ?IS_FOLD_FUTURE = FF, Fun, Acc, Options) ->
+    wait_and_apply(NifTx, [FF], Fun, Acc, Options);
 fold_range_wait(?IS_SS = SS, ?IS_FOLD_FUTURE = FF, Fun, Acc, Options) ->
     fold_range_wait(?GET_TX(SS), FF, Fun, Acc, Options).
 
@@ -1433,10 +1652,21 @@ set(?IS_DB = Db, Key, Value) ->
     transactional(Db, fun(Tx) ->
         set(Tx, Key, Value)
     end);
+set(?IS_NIF_DB = NifDb, Key, Value) ->
+    transactional(NifDb, fun(Tx) ->
+        set(Tx, Key, Value)
+    end);
 set(?IS_TX = Tx, Key, Value) ->
-    erlfdb_nif:transaction_set(Tx, Key, Value);
+    set_(erlfdb_port, Tx, Key, Value);
+set(?IS_NIF_TX = NifTx, Key, Value) ->
+    set_(erlfdb_nif, NifTx, Key, Value);
 set(?IS_SS = SS, Key, Value) ->
-    set(?GET_TX(SS), Key, Value).
+    set_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), Key, Value).
+
+set_(erlfdb_nif, Tx, Key, Value) ->
+    erlfdb_nif:transaction_set(Tx, Key, Value);
+set_(erlfdb_port, Tx, Key, Value) ->
+    erlfdb_port:transaction_set(Tx, Key, Value).
 
 -if(?DOCATTRS).
 -doc """
@@ -1469,10 +1699,21 @@ clear(?IS_DB = Db, Key) ->
     transactional(Db, fun(Tx) ->
         clear(Tx, Key)
     end);
+clear(?IS_NIF_DB = NifDb, Key) ->
+    transactional(NifDb, fun(Tx) ->
+        clear(Tx, Key)
+    end);
 clear(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_clear(Tx, Key);
+    clear_(erlfdb_port, Tx, Key);
+clear(?IS_NIF_TX = NifTx, Key) ->
+    clear_(erlfdb_nif, NifTx, Key);
 clear(?IS_SS = SS, Key) ->
-    clear(?GET_TX(SS), Key).
+    clear_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), Key).
+
+clear_(erlfdb_nif, Tx, Key) ->
+    erlfdb_nif:transaction_clear(Tx, Key);
+clear_(erlfdb_port, Tx, Key) ->
+    erlfdb_port:transaction_clear(Tx, Key).
 
 -if(?DOCATTRS).
 -doc """
@@ -1505,10 +1746,21 @@ clear_range(?IS_DB = Db, StartKey, EndKey) ->
     transactional(Db, fun(Tx) ->
         clear_range(Tx, StartKey, EndKey)
     end);
+clear_range(?IS_NIF_DB = NifDb, StartKey, EndKey) ->
+    transactional(NifDb, fun(Tx) ->
+        clear_range(Tx, StartKey, EndKey)
+    end);
 clear_range(?IS_TX = Tx, StartKey, EndKey) ->
-    erlfdb_nif:transaction_clear_range(Tx, StartKey, EndKey);
+    clear_range_(erlfdb_port, Tx, StartKey, EndKey);
+clear_range(?IS_NIF_TX = NifTx, StartKey, EndKey) ->
+    clear_range_(erlfdb_nif, NifTx, StartKey, EndKey);
 clear_range(?IS_SS = SS, StartKey, EndKey) ->
-    clear_range(?GET_TX(SS), StartKey, EndKey).
+    clear_range_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), StartKey, EndKey).
+
+clear_range_(erlfdb_nif, Tx, StartKey, EndKey) ->
+    erlfdb_nif:transaction_clear_range(Tx, StartKey, EndKey);
+clear_range_(erlfdb_port, Tx, StartKey, EndKey) ->
+    erlfdb_port:transaction_clear_range(Tx, StartKey, EndKey).
 
 -if(?DOCATTRS).
 -doc """
@@ -1522,11 +1774,16 @@ clear_range_startswith(?IS_DB = Db, Prefix) ->
     transactional(Db, fun(Tx) ->
         clear_range_startswith(Tx, Prefix)
     end);
+clear_range_startswith(?IS_NIF_DB = NifDb, Prefix) ->
+    transactional(NifDb, fun(Tx) ->
+        clear_range_startswith(Tx, Prefix)
+    end);
 clear_range_startswith(?IS_TX = Tx, Prefix) ->
-    EndKey = erlfdb_key:strinc(Prefix),
-    erlfdb_nif:transaction_clear_range(Tx, Prefix, EndKey);
+    clear_range_(erlfdb_port, Tx, Prefix, erlfdb_key:strinc(Prefix));
+clear_range_startswith(?IS_NIF_TX = NifTx, Prefix) ->
+    clear_range_(erlfdb_nif, NifTx, Prefix, erlfdb_key:strinc(Prefix));
 clear_range_startswith(?IS_SS = SS, Prefix) ->
-    clear_range_startswith(?GET_TX(SS), Prefix).
+    clear_range_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), Prefix, erlfdb_key:strinc(Prefix)).
 
 -if(?DOCATTRS).
 -doc """
@@ -1673,10 +1930,21 @@ atomic_op(?IS_DB = Db, Key, Param, Op) ->
     transactional(Db, fun(Tx) ->
         atomic_op(Tx, Key, Param, Op)
     end);
+atomic_op(?IS_NIF_DB = NifDb, Key, Param, Op) ->
+    transactional(NifDb, fun(Tx) ->
+        atomic_op(Tx, Key, Param, Op)
+    end);
 atomic_op(?IS_TX = Tx, Key, Param, Op) ->
-    erlfdb_nif:transaction_atomic_op(Tx, Key, Param, Op);
+    atomic_op_(erlfdb_port, Tx, Key, Param, Op);
+atomic_op(?IS_NIF_TX = NifTx, Key, Param, Op) ->
+    atomic_op_(erlfdb_nif, NifTx, Key, Param, Op);
 atomic_op(?IS_SS = SS, Key, Param, Op) ->
-    atomic_op(?GET_TX(SS), Key, Param, Op).
+    atomic_op_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), Key, Param, Op).
+
+atomic_op_(erlfdb_nif, Tx, Key, Param, Op) ->
+    erlfdb_nif:transaction_atomic_op(Tx, Key, Param, Op);
+atomic_op_(erlfdb_port, Tx, Key, Param, Op) ->
+    erlfdb_port:transaction_atomic_op(Tx, Key, Param, Op).
 
 -if(?DOCATTRS).
 -doc """
@@ -1729,11 +1997,23 @@ watch(?IS_DB = Db, Key, Options) ->
     transactional(Db, fun(Tx) ->
         watch(Tx, Key, Options)
     end);
+watch(?IS_NIF_DB = NifDb, Key, Options) ->
+    transactional(NifDb, fun(Tx) ->
+        watch(Tx, Key, Options)
+    end);
 watch(?IS_TX = Tx, Key, Options) ->
     To = proplists:get_value(to, Options, self()),
-    erlfdb_nif:transaction_watch(Tx, Key, To);
+    watch_(erlfdb_port, Tx, Key, To);
+watch(?IS_NIF_TX = NifTx, Key, Options) ->
+    To = proplists:get_value(to, Options, self()),
+    watch_(erlfdb_nif, NifTx, Key, To);
 watch(?IS_SS = SS, Key, Options) ->
     watch(?GET_TX(SS), Key, Options).
+
+watch_(erlfdb_nif, Tx, Key, To) ->
+    erlfdb_nif:transaction_watch(Tx, Key, To);
+watch_(erlfdb_port, Tx, Key, To) ->
+    erlfdb_port:transaction_watch(Tx, Key, To).
 
 -if(?DOCATTRS).
 -doc """
@@ -1835,9 +2115,16 @@ This is not needed in simple cases.
 -endif.
 -spec add_conflict_range(transaction() | snapshot(), key(), key(), read | write) -> ok.
 add_conflict_range(?IS_TX = Tx, StartKey, EndKey, Type) ->
-    erlfdb_nif:transaction_add_conflict_range(Tx, StartKey, EndKey, Type);
+    add_conflict_range_(erlfdb_port, Tx, StartKey, EndKey, Type);
+add_conflict_range(?IS_NIF_TX = NifTx, StartKey, EndKey, Type) ->
+    add_conflict_range_(erlfdb_nif, NifTx, StartKey, EndKey, Type);
 add_conflict_range(?IS_SS = SS, StartKey, EndKey, Type) ->
-    add_conflict_range(?GET_TX(SS), StartKey, EndKey, Type).
+    add_conflict_range_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), StartKey, EndKey, Type).
+
+add_conflict_range_(erlfdb_nif, Tx, StartKey, EndKey, Type) ->
+    erlfdb_nif:transaction_add_conflict_range(Tx, StartKey, EndKey, Type);
+add_conflict_range_(erlfdb_port, Tx, StartKey, EndKey, Type) ->
+    erlfdb_port:transaction_add_conflict_range(Tx, StartKey, EndKey, Type).
 
 -if(?DOCATTRS).
 -doc """
@@ -1850,9 +2137,16 @@ This is not needed in simple cases.
 -endif.
 -spec set_read_version(transaction() | snapshot(), version()) -> ok.
 set_read_version(?IS_TX = Tx, Version) ->
-    erlfdb_nif:transaction_set_read_version(Tx, Version);
+    set_read_version_(erlfdb_port, Tx, Version);
+set_read_version(?IS_NIF_TX = NifTx, Version) ->
+    set_read_version_(erlfdb_nif, NifTx, Version);
 set_read_version(?IS_SS = SS, Version) ->
-    set_read_version(?GET_TX(SS), Version).
+    set_read_version_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), Version).
+
+set_read_version_(erlfdb_nif, Tx, Version) ->
+    erlfdb_nif:transaction_set_read_version(Tx, Version);
+set_read_version_(erlfdb_port, Tx, Version) ->
+    erlfdb_port:transaction_set_read_version(Tx, Version).
 
 -if(?DOCATTRS).
 -doc """
@@ -1865,9 +2159,16 @@ This is not needed in simple cases.
 -endif.
 -spec get_read_version(transaction() | snapshot()) -> future().
 get_read_version(?IS_TX = Tx) ->
-    erlfdb_nif:transaction_get_read_version(Tx);
+    get_read_version_(erlfdb_port, Tx);
+get_read_version(?IS_NIF_TX = NifTx) ->
+    get_read_version_(erlfdb_nif, NifTx);
 get_read_version(?IS_SS = SS) ->
-    get_read_version(?GET_TX(SS)).
+    get_read_version_(tx_mod(?GET_TX(SS)), ?GET_TX(SS)).
+
+get_read_version_(erlfdb_nif, Tx) ->
+    erlfdb_nif:transaction_get_read_version(Tx);
+get_read_version_(erlfdb_port, Tx) ->
+    erlfdb_port:transaction_get_read_version(Tx).
 
 -if(?DOCATTRS).
 -doc """
@@ -1880,9 +2181,16 @@ This is not needed in simple cases. Not compatible with `transactional/2`.
 -endif.
 -spec get_committed_version(transaction() | snapshot()) -> version().
 get_committed_version(?IS_TX = Tx) ->
-    erlfdb_nif:transaction_get_committed_version(Tx);
+    get_committed_version_(erlfdb_port, Tx);
+get_committed_version(?IS_NIF_TX = NifTx) ->
+    get_committed_version_(erlfdb_nif, NifTx);
 get_committed_version(?IS_SS = SS) ->
-    get_committed_version(?GET_TX(SS)).
+    get_committed_version_(tx_mod(?GET_TX(SS)), ?GET_TX(SS)).
+
+get_committed_version_(erlfdb_nif, Tx) ->
+    erlfdb_nif:transaction_get_committed_version(Tx);
+get_committed_version_(erlfdb_port, Tx) ->
+    erlfdb_port:transaction_get_committed_version(Tx).
 
 -if(?DOCATTRS).
 -doc """
@@ -1908,9 +2216,17 @@ This is not needed in simple cases.
 -spec get_versionstamp(transaction() | snapshot(), list(get_versionstamp_option())) -> future().
 get_versionstamp(?IS_TX = Tx, Options) ->
     To = proplists:get_value(to, Options, self()),
-    erlfdb_nif:transaction_get_versionstamp(Tx, To);
+    get_versionstamp_(erlfdb_port, Tx, To);
+get_versionstamp(?IS_NIF_TX = NifTx, Options) ->
+    To = proplists:get_value(to, Options, self()),
+    get_versionstamp_(erlfdb_nif, NifTx, To);
 get_versionstamp(?IS_SS = SS, Options) ->
     get_versionstamp(?GET_TX(SS), Options).
+
+get_versionstamp_(erlfdb_nif, Tx, To) ->
+    erlfdb_nif:transaction_get_versionstamp(Tx, To);
+get_versionstamp_(erlfdb_port, Tx, To) ->
+    erlfdb_port:transaction_get_versionstamp(Tx, To).
 
 -if(?DOCATTRS).
 -doc """
@@ -1921,9 +2237,16 @@ Gets the approximate transaction size so far.
 -endif.
 -spec get_approximate_size(transaction() | snapshot()) -> future().
 get_approximate_size(?IS_TX = Tx) ->
-    erlfdb_nif:transaction_get_approximate_size(Tx);
+    get_approximate_size_(erlfdb_port, Tx);
+get_approximate_size(?IS_NIF_TX = NifTx) ->
+    get_approximate_size_(erlfdb_nif, NifTx);
 get_approximate_size(?IS_SS = SS) ->
-    get_approximate_size(?GET_TX(SS)).
+    get_approximate_size_(tx_mod(?GET_TX(SS)), ?GET_TX(SS)).
+
+get_approximate_size_(erlfdb_nif, Tx) ->
+    erlfdb_nif:transaction_get_approximate_size(Tx);
+get_approximate_size_(erlfdb_port, Tx) ->
+    erlfdb_port:transaction_get_approximate_size(Tx).
 
 -if(?DOCATTRS).
 -doc """
@@ -1959,9 +2282,16 @@ exactly one versionstamp is created at commit time.
 -endif.
 -spec get_next_tx_id(transaction() | snapshot()) -> 0..65535.
 get_next_tx_id(?IS_TX = Tx) ->
-    erlfdb_nif:transaction_get_next_tx_id(Tx);
+    get_next_tx_id_(erlfdb_port, Tx);
+get_next_tx_id(?IS_NIF_TX = NifTx) ->
+    get_next_tx_id_(erlfdb_nif, NifTx);
 get_next_tx_id(?IS_SS = SS) ->
-    get_next_tx_id(?GET_TX(SS)).
+    get_next_tx_id_(tx_mod(?GET_TX(SS)), ?GET_TX(SS)).
+
+get_next_tx_id_(erlfdb_nif, Tx) ->
+    erlfdb_nif:transaction_get_next_tx_id(Tx);
+get_next_tx_id_(erlfdb_port, Tx) ->
+    erlfdb_port:transaction_get_next_tx_id(Tx).
 
 -if(?DOCATTRS).
 -doc """
@@ -1970,9 +2300,16 @@ Returns true if all operations on the transaction up until now have been reads.
 -endif.
 -spec is_read_only(transaction() | snapshot()) -> boolean().
 is_read_only(?IS_TX = Tx) ->
-    erlfdb_nif:transaction_is_read_only(Tx);
+    is_read_only_(erlfdb_port, Tx);
+is_read_only(?IS_NIF_TX = NifTx) ->
+    is_read_only_(erlfdb_nif, NifTx);
 is_read_only(?IS_SS = SS) ->
-    is_read_only(?GET_TX(SS)).
+    is_read_only_(tx_mod(?GET_TX(SS)), ?GET_TX(SS)).
+
+is_read_only_(erlfdb_nif, Tx) ->
+    erlfdb_nif:transaction_is_read_only(Tx);
+is_read_only_(erlfdb_port, Tx) ->
+    erlfdb_port:transaction_is_read_only(Tx).
 
 -if(?DOCATTRS).
 -doc """
@@ -1981,9 +2318,16 @@ Returns true if at least one operation on the transaction up until now has been 
 -endif.
 -spec has_watches(transaction() | snapshot()) -> boolean().
 has_watches(?IS_TX = Tx) ->
-    erlfdb_nif:transaction_has_watches(Tx);
+    has_watches_(erlfdb_port, Tx);
+has_watches(?IS_NIF_TX = NifTx) ->
+    has_watches_(erlfdb_nif, NifTx);
 has_watches(?IS_SS = SS) ->
-    has_watches(?GET_TX(SS)).
+    has_watches_(tx_mod(?GET_TX(SS)), ?GET_TX(SS)).
+
+has_watches_(erlfdb_nif, Tx) ->
+    erlfdb_nif:transaction_has_watches(Tx);
+has_watches_(erlfdb_port, Tx) ->
+    erlfdb_port:transaction_has_watches(Tx).
 
 -if(?DOCATTRS).
 -doc """
@@ -1992,9 +2336,16 @@ Returns false if `disallow_writes` was set on the transaction.
 -endif.
 -spec get_writes_allowed(transaction() | snapshot()) -> boolean().
 get_writes_allowed(?IS_TX = Tx) ->
-    erlfdb_nif:transaction_get_writes_allowed(Tx);
+    get_writes_allowed_(erlfdb_port, Tx);
+get_writes_allowed(?IS_NIF_TX = NifTx) ->
+    get_writes_allowed_(erlfdb_nif, NifTx);
 get_writes_allowed(?IS_SS = SS) ->
-    get_writes_allowed(?GET_TX(SS)).
+    get_writes_allowed_(tx_mod(?GET_TX(SS)), ?GET_TX(SS)).
+
+get_writes_allowed_(erlfdb_nif, Tx) ->
+    erlfdb_nif:transaction_get_writes_allowed(Tx);
+get_writes_allowed_(erlfdb_port, Tx) ->
+    erlfdb_port:transaction_get_writes_allowed(Tx).
 
 -if(?DOCATTRS).
 -doc """
@@ -2005,7 +2356,14 @@ Returns a value where 0 indicates that the client is idle and 1 (or larger) indi
 -endif.
 -spec get_main_thread_busyness(database()) -> float().
 get_main_thread_busyness(?IS_DB = Db) ->
-    erlfdb_nif:database_get_main_thread_busyness(Db).
+    get_main_thread_busyness_(erlfdb_port, Db);
+get_main_thread_busyness(?IS_NIF_DB = NifDb) ->
+    get_main_thread_busyness_(erlfdb_nif, NifDb).
+
+get_main_thread_busyness_(erlfdb_nif, Db) ->
+    erlfdb_nif:database_get_main_thread_busyness(Db);
+get_main_thread_busyness_(erlfdb_port, Db) ->
+    erlfdb_port:database_get_main_thread_busyness(Db).
 
 -if(?DOCATTRS).
 -doc """
@@ -2016,7 +2374,14 @@ Returns a JSON binary-string containing database client-side status information.
 -endif.
 -spec get_client_status(database()) -> future().
 get_client_status(?IS_DB = Db) ->
-    erlfdb_nif:database_get_client_status(Db).
+    get_client_status_(erlfdb_port, Db);
+get_client_status(?IS_NIF_DB = NifDb) ->
+    get_client_status_(erlfdb_nif, NifDb).
+
+get_client_status_(erlfdb_nif, Db) ->
+    erlfdb_nif:database_get_client_status(Db);
+get_client_status_(erlfdb_port, Db) ->
+    erlfdb_port:database_get_client_status(Db).
 
 -if(?DOCATTRS).
 -doc """
@@ -2030,10 +2395,21 @@ get_addresses_for_key(?IS_DB = Db, Key) ->
     transactional(Db, fun(Tx) ->
         wait(get_addresses_for_key(Tx, Key))
     end);
+get_addresses_for_key(?IS_NIF_DB = NifDb, Key) ->
+    transactional(NifDb, fun(Tx) ->
+        wait(get_addresses_for_key(Tx, Key))
+    end);
 get_addresses_for_key(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_get_addresses_for_key(Tx, Key);
+    get_addresses_for_key_(erlfdb_port, Tx, Key);
+get_addresses_for_key(?IS_NIF_TX = NifTx, Key) ->
+    get_addresses_for_key_(erlfdb_nif, NifTx, Key);
 get_addresses_for_key(?IS_SS = SS, Key) ->
-    get_addresses_for_key(?GET_TX(SS), Key).
+    get_addresses_for_key_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), Key).
+
+get_addresses_for_key_(erlfdb_nif, Tx, Key) ->
+    erlfdb_nif:transaction_get_addresses_for_key(Tx, Key);
+get_addresses_for_key_(erlfdb_port, Tx, Key) ->
+    erlfdb_port:transaction_get_addresses_for_key(Tx, Key).
 
 -if(?DOCATTRS).
 -doc """
@@ -2044,9 +2420,16 @@ Returns an estimated byte size of the key range.
 -endif.
 -spec get_estimated_range_size(transaction() | snapshot(), key(), key()) -> future().
 get_estimated_range_size(?IS_TX = Tx, StartKey, EndKey) ->
-    erlfdb_nif:transaction_get_estimated_range_size(Tx, StartKey, EndKey);
+    get_estimated_range_size_(erlfdb_port, Tx, StartKey, EndKey);
+get_estimated_range_size(?IS_NIF_TX = NifTx, StartKey, EndKey) ->
+    get_estimated_range_size_(erlfdb_nif, NifTx, StartKey, EndKey);
 get_estimated_range_size(?IS_SS = SS, StartKey, EndKey) ->
-    erlfdb_nif:transaction_get_estimated_range_size(?GET_TX(SS), StartKey, EndKey).
+    get_estimated_range_size_(tx_mod(?GET_TX(SS)), ?GET_TX(SS), StartKey, EndKey).
+
+get_estimated_range_size_(erlfdb_nif, Tx, StartKey, EndKey) ->
+    erlfdb_nif:transaction_get_estimated_range_size(Tx, StartKey, EndKey);
+get_estimated_range_size_(erlfdb_port, Tx, StartKey, EndKey) ->
+    erlfdb_port:transaction_get_estimated_range_size(Tx, StartKey, EndKey).
 
 -if(?DOCATTRS).
 -doc """
@@ -2073,10 +2456,19 @@ Implements the recommended retry and backoff behavior for a transaction.
 -spec on_error(transaction() | snapshot(), error() | integer()) -> future().
 on_error(?IS_TX = Tx, {erlfdb_error, ErrorCode}) ->
     on_error(Tx, ErrorCode);
+on_error(?IS_NIF_TX = NifTx, {erlfdb_error, ErrorCode}) ->
+    on_error(NifTx, ErrorCode);
 on_error(?IS_TX = Tx, ErrorCode) ->
-    erlfdb_nif:transaction_on_error(Tx, ErrorCode);
+    on_error_(erlfdb_port, Tx, ErrorCode);
+on_error(?IS_NIF_TX = NifTx, ErrorCode) ->
+    on_error_(erlfdb_nif, NifTx, ErrorCode);
 on_error(?IS_SS = SS, Error) ->
     on_error(?GET_TX(SS), Error).
+
+on_error_(erlfdb_nif, Tx, ErrorCode) ->
+    erlfdb_nif:transaction_on_error(Tx, ErrorCode);
+on_error_(erlfdb_port, Tx, ErrorCode) ->
+    erlfdb_port:transaction_on_error(Tx, ErrorCode).
 
 -if(?DOCATTRS).
 -doc """
@@ -2089,7 +2481,12 @@ Evaluates a predicate against an error code.
 error_predicate(Predicate, {erlfdb_error, ErrorCode}) ->
     error_predicate(Predicate, ErrorCode);
 error_predicate(Predicate, ErrorCode) ->
-    erlfdb_nif:error_predicate(Predicate, ErrorCode).
+    error_predicate_(backend(), Predicate, ErrorCode).
+
+error_predicate_(erlfdb_nif, Predicate, ErrorCode) ->
+    erlfdb_nif:error_predicate(Predicate, ErrorCode);
+error_predicate_(erlfdb_port, Predicate, ErrorCode) ->
+    erlfdb_port:error_predicate(Predicate, ErrorCode).
 
 -if(?DOCATTRS).
 -doc """
@@ -2109,7 +2506,12 @@ Returns a (somewhat) human-readable English message from an error code.
 -endif.
 -spec get_error_string(integer()) -> binary().
 get_error_string(ErrorCode) when is_integer(ErrorCode) ->
-    erlfdb_nif:get_error(ErrorCode).
+    get_error_string_(backend(), ErrorCode).
+
+get_error_string_(erlfdb_nif, ErrorCode) ->
+    erlfdb_nif:get_error(ErrorCode);
+get_error_string_(erlfdb_port, ErrorCode) ->
+    erlfdb_port:get_error(ErrorCode).
 
 -spec clear_erlfdb_error() -> ok.
 clear_erlfdb_error() ->
@@ -2117,6 +2519,11 @@ clear_erlfdb_error() ->
 
 -spec do_transaction(transaction(), function(), integer()) -> any().
 do_transaction(?IS_TX = Tx, UserFun, Depth) ->
+    do_transaction_(Tx, UserFun, Depth);
+do_transaction(?IS_NIF_TX = Tx, UserFun, Depth) ->
+    do_transaction_(Tx, UserFun, Depth).
+
+do_transaction_(Tx, UserFun, Depth) ->
     try
         Ret = UserFun(Tx),
         case is_read_only(Tx) andalso not has_watches(Tx) of
@@ -2130,7 +2537,7 @@ do_transaction(?IS_TX = Tx, UserFun, Depth) ->
             wait(on_error(Tx, Code), [{timeout, infinity}]),
             if
                 Depth == 0 ->
-                    Result = do_transaction(Tx, UserFun, Depth + 1),
+                    Result = do_transaction_(Tx, UserFun, Depth + 1),
 
                     % Entering a Depth >=1 signals that previously attempted
                     % futures may still have ready messages in the message
@@ -2140,13 +2547,16 @@ do_transaction(?IS_TX = Tx, UserFun, Depth) ->
 
                     Result;
                 true ->
-                    do_transaction(Tx, UserFun, Depth + 1)
+                    do_transaction_(Tx, UserFun, Depth + 1)
             end
     end.
 
 -spec folding_get_range_and_wait(transaction(), key(), key(), function(), any(), [fold_option()]) ->
     any().
 folding_get_range_and_wait(?IS_TX = Tx, StartKey, EndKey, Fun, Acc, Options) ->
+    St = options_to_fold_st(StartKey, EndKey, Options),
+    fold_interleaving_and_wait(Tx, [St], Fun, Acc, Options);
+folding_get_range_and_wait(?IS_NIF_TX = Tx, StartKey, EndKey, Fun, Acc, Options) ->
     St = options_to_fold_st(StartKey, EndKey, Options),
     fold_interleaving_and_wait(Tx, [St], Fun, Acc, Options).
 
@@ -2277,6 +2687,47 @@ get_last_key(Rows, #fold_st{mapper = _Mapper}) ->
     K.
 
 -spec folding_get_future(transaction(), #fold_st{}) -> fold_future().
+folding_get_future(?IS_NIF_TX = Tx, #fold_st{mapper = undefined} = St) ->
+    #fold_st{
+        start_key = StartKey,
+        end_key = EndKey,
+        limit = Limit,
+        target_bytes = TargetBytes,
+        streaming_mode = StreamingMode,
+        iteration = Iteration,
+        snapshot = Snapshot,
+        reverse = Reverse
+    } = St,
+    Future = erlfdb_nif:transaction_get_range(
+        Tx, StartKey, EndKey, Limit, TargetBytes,
+        StreamingMode, Iteration, Snapshot, Reverse
+    ),
+    NewSt = case St of
+        #fold_st{from = undefined} -> St#fold_st{from = Future};
+        _ -> St
+    end,
+    #fold_future{st = NewSt, future = Future};
+folding_get_future(?IS_NIF_TX = Tx, #fold_st{} = St) ->
+    #fold_st{
+        start_key = StartKey,
+        end_key = EndKey,
+        mapper = Mapper,
+        limit = Limit,
+        target_bytes = TargetBytes,
+        streaming_mode = StreamingMode,
+        iteration = Iteration,
+        snapshot = Snapshot,
+        reverse = Reverse
+    } = St,
+    Future = erlfdb_nif:transaction_get_mapped_range(
+        Tx, StartKey, EndKey, Mapper, Limit, TargetBytes,
+        StreamingMode, Iteration, Snapshot, Reverse
+    ),
+    NewSt = case St of
+        #fold_st{from = undefined} -> St#fold_st{from = Future};
+        _ -> St
+    end,
+    #fold_future{st = NewSt, future = Future};
 folding_get_future(?IS_TX = Tx, #fold_st{mapper = undefined} = St) ->
     #fold_st{
         start_key = StartKey,
@@ -2289,7 +2740,7 @@ folding_get_future(?IS_TX = Tx, #fold_st{mapper = undefined} = St) ->
         reverse = Reverse
     } = St,
 
-    Future = erlfdb_nif:transaction_get_range(
+    Future = erlfdb_port:transaction_get_range(
         Tx,
         StartKey,
         EndKey,
@@ -2321,7 +2772,7 @@ folding_get_future(?IS_TX = Tx, #fold_st{} = St) ->
         reverse = Reverse
     } = St,
 
-    Future = erlfdb_nif:transaction_get_mapped_range(
+    Future = erlfdb_port:transaction_get_mapped_range(
         Tx,
         StartKey,
         EndKey,
@@ -2365,31 +2816,47 @@ options_to_fold_st(StartKey, EndKey, Options) ->
 
 -spec flush_future_message(future()) -> ok.
 flush_future_message(?IS_FUTURE = Future) ->
+    flush_future_(fut_mod(Future), Future).
+
+flush_future_(erlfdb_nif, Future) ->
+    %% Set the cancelled flag before draining. This prevents an async FDB
+    %% network-thread callback from sending a {ready} message after the
+    %% receive's after-0 fires — the callback checks cancelled and skips send.
     erlfdb_nif:future_silence(Future),
-    {erlfdb_future, MsgRef, _Res} = Future,
+    {erlfdb_future, MsgRef, _} = Future,
     receive
         {MsgRef, ready} -> ok;
         {{_TxRef, MsgRef}, ready} -> ok
-    after 0 -> ok
+    after 0 ->
+        ok
+    end;
+flush_future_(erlfdb_port, Future) ->
+    erlfdb_port:future_silence(Future),
+    {erlfdb_future, _Worker, MsgRef} = Future,
+    receive
+        {MsgRef, ready} -> ok;
+        {{_TxRef, MsgRef}, ready} -> ok
+    after 200 ->
+        %% Port cancel callbacks fire asynchronously from the FDB network
+        %% thread; 200 ms gives the notification pipeline time to deliver.
+        ok
     end.
 
-flush_transaction_ready_messages({erlfdb_transaction, TxRef} = Tx) ->
+flush_transaction_ready_messages({erlfdb_transaction, _Worker, TxRef} = Tx) ->
+    %% port transaction — flush pending ready messages
     receive
         {{TxRef, _}, ready} ->
             flush_transaction_ready_messages(Tx)
     after 0 ->
         ok
+    end;
+flush_transaction_ready_messages({erlfdb_transaction, TxRef} = Tx) ->
+    %% NIF: callbacks fire from the FDB network thread; brief wait for async
+    %% delivery before draining with after-0 loop.
+    receive
+        {{TxRef, _}, ready} ->
+            flush_transaction_ready_messages(Tx)
+    after 50 ->
+        ok
     end.
 
-open_dist_key(Type, UidData) ->
-    {?MODULE, open, Type, UidData}.
-
-open_with_key(Key, ClusterFile) ->
-    case persistent_term:get(Key, undefined) of
-        undefined ->
-            Db = create_database(ClusterFile),
-            persistent_term:put(Key, Db),
-            Db;
-        Db ->
-            Db
-    end.

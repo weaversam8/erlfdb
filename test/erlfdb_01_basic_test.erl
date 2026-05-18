@@ -14,13 +14,25 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-load_test() ->
-    erlfdb_nif:ohai().
+-define(BACKENDS, [erlfdb_nif, erlfdb_port]).
 
-get_error_string_test() ->
-    ?assertEqual(<<"Success">>, erlfdb_nif:get_error(0)),
+backends_test_() ->
+    [{atom_to_list(B),
+      {setup,
+       fun() -> application:set_env(erlfdb, backend, B) end,
+       fun(_) -> application:set_env(erlfdb, backend, erlfdb_port) end,
+       [fun t_load/0, fun t_get_error_string/0]}}
+     || B <- ?BACKENDS].
+
+t_load() ->
+    ok = application:ensure_started(erlfdb),
+    ok.
+
+t_get_error_string() ->
+    ok = application:ensure_started(erlfdb),
+    ?assertEqual(<<"Success">>, erlfdb:get_error_string(0)),
     ?assertEqual(
         <<"Transaction exceeds byte limit">>,
-        erlfdb_nif:get_error(2101)
+        erlfdb:get_error_string(2101)
     ),
-    ?assertEqual(<<"UNKNOWN_ERROR">>, erlfdb_nif:get_error(9999)).
+    ?assertEqual(<<"UNKNOWN_ERROR">>, erlfdb:get_error_string(9999)).

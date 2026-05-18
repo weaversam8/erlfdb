@@ -31,7 +31,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, open/2]).
+-export([start_link/0, open/2, open_for_scheduler/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
@@ -50,6 +50,20 @@ open(ClusterFile, Options) ->
         undefined ->
             %% Serialise creation through the gen_server to prevent duplicate
             %% creates under concurrent first-open calls for the same key.
+            gen_server:call(?MODULE, {open, Key, ClusterFile});
+        Db ->
+            Db
+    end.
+
+%% Like open/2 but pins the persistent_term key to a specific scheduler ID.
+%% Used by erlfdb:open_all/2 to pre-warm one entry per scheduler.
+-spec open_for_scheduler(ClusterFile :: binary(), Options :: list(),
+                          SchedulerId :: pos_integer()) ->
+    {erlfdb_database, pid(), reference()}.
+open_for_scheduler(ClusterFile, Options, SchedulerId) ->
+    Key = dist_key_for_scheduler(ClusterFile, Options, SchedulerId),
+    case persistent_term:get(Key, undefined) of
+        undefined ->
             gen_server:call(?MODULE, {open, Key, ClusterFile});
         Db ->
             Db
@@ -94,13 +108,13 @@ code_change(_Old, State, _Extra) ->
 %% Internal helpers
 %% ---------------------------------------------------------------------------
 
-%% Mirror of erlfdb.erl:open_dist_key/2 — same key shape so the two code
-%% paths (NIF and port) share the same persistent_term namespace.
 dist_key(ClusterFile, Options) ->
+    dist_key_for_scheduler(ClusterFile, Options, erlang:system_info(scheduler_id)).
+
+dist_key_for_scheduler(ClusterFile, Options, SchedulerId) ->
     case proplists:get_value(dist, Options, scheduler_id) of
         scheduler_id ->
-            {erlfdb, open, scheduler_id,
-             {ClusterFile, erlang:system_info(scheduler_id)}};
+            {erlfdb, open, scheduler_id, {ClusterFile, SchedulerId}};
         cluster_file ->
             {erlfdb, open, cluster_file, ClusterFile}
     end.

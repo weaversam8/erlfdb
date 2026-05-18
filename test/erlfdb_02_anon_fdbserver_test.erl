@@ -14,28 +14,78 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-basic_init_test() ->
+-define(BACKENDS, [erlfdb_nif, erlfdb_port]).
+
+%% ---------------------------------------------------------------------------
+%% Test generator — runs every test against both NIF and port backends.
+%% ---------------------------------------------------------------------------
+
+backends_test_() ->
+    Tests = [
+        fun t_basic_init/0,
+        fun t_basic_open/0,
+        fun t_get_db/0,
+        fun t_db_client_info/0,
+        fun t_get_set_get/0,
+        fun t_get_empty/0,
+        fun t_get_set_get_tenant/0,
+        fun t_get_range/0,
+        fun t_interleaving/0,
+        fun t_get_mapped_range_minimal/0,
+        fun t_get_mapped_range_continuation/0,
+        fun t_flush_foregone_futures/0,
+        fun t_versionstamp/0,
+        fun t_watch/0,
+        fun t_watch_cancel/0,
+        fun t_watch_to/0,
+        fun t_range_iterator/0,
+        fun t_directory_cache_create_or_open/0,
+        fun t_directory_cache_open_returns_cached_node/0,
+        fun t_directory_cache_invalidate/0,
+        fun t_directory_cache_open_missing/0,
+        fun t_directory_cache_purge_all/0,
+        fun t_directory_cache_purge_ttl/0,
+        fun t_directory_cache_purge_keeps_fresh/0,
+        fun t_directory_cache_store_equivalent_to_open/0
+    ],
+    [{atom_to_list(B),
+      {setup,
+       fun() -> application:set_env(erlfdb, backend, B) end,
+       fun(_) ->
+           %% Delete named ETS tables created by directory cache tests so the
+           %% next backend's run can create them fresh.
+           lists:foreach(fun(T) -> catch ets:delete(T) end, dir_cache_tables()),
+           application:set_env(erlfdb, backend, erlfdb_port)
+       end,
+       Tests}}
+     || B <- ?BACKENDS].
+
+%% ---------------------------------------------------------------------------
+%% Tests
+%% ---------------------------------------------------------------------------
+
+t_basic_init() ->
     {ok, ClusterFile} = erlfdb_util:init_test_cluster(erlfdb_sandbox:default_options()),
     ?assert(is_binary(ClusterFile)).
 
-basic_open_test() ->
+t_basic_open() ->
     {ok, ClusterFile} = erlfdb_util:init_test_cluster(erlfdb_sandbox:default_options()),
     Db = erlfdb:open(ClusterFile),
     erlfdb:transactional(Db, fun(_Tx) ->
         ?assert(true)
     end).
 
-get_db_test() ->
+t_get_db() ->
     Db = erlfdb_sandbox:open(),
     erlfdb:transactional(Db, fun(_Tx) ->
         ?assert(true)
     end).
 
-db_client_info_test() ->
+t_db_client_info() ->
     Db = erlfdb_sandbox:open(),
     Busyness = erlfdb:get_main_thread_busyness(Db),
     ?assert(is_float(Busyness)),
-    Vsn = erlfdb_nif:get_default_api_version(),
+    Vsn = erlfdb_port:get_default_api_version(),
     if
         Vsn >= 730 ->
             Status = erlfdb:wait(erlfdb:get_client_status(Db)),
@@ -44,11 +94,11 @@ db_client_info_test() ->
             ok
     end.
 
-get_set_get_test() ->
+t_get_set_get() ->
     Db = erlfdb_sandbox:open(),
     get_set_get(Db).
 
-get_empty_test() ->
+t_get_empty() ->
     Db = erlfdb_sandbox:open(),
     Tenant1 = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     Key = gen_key(8),
@@ -66,19 +116,18 @@ get_empty_test() ->
         ?assertEqual(not_found, erlfdb:wait(erlfdb:get(Tx, Key)))
     end),
 
-    % And check state that the old db handle is
-    % the same
+    % And check state that the old db handle is the same
     erlfdb:transactional(Tenant1, fun(Tx) ->
         ?assertEqual(not_found, erlfdb:wait(erlfdb:get(Tx, Key)))
     end).
 
-get_set_get_tenant_test() ->
+t_get_set_get_tenant() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     get_set_get(Tenant),
     erlfdb_util:clear_and_delete_test_tenant(Db).
 
-get_range_test() ->
+t_get_range() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
 
@@ -92,7 +141,7 @@ get_range_test() ->
 
     ?assertEqual(KVs, GetRangeResult),
 
-    Vsn = erlfdb_nif:get_default_api_version(),
+    Vsn = erlfdb_port:get_default_api_version(),
 
     if
         Vsn >= 730 ->
@@ -113,7 +162,7 @@ get_range_test() ->
             ok
     end.
 
-interleaving_test() ->
+t_interleaving() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
 
@@ -123,7 +172,7 @@ interleaving_test() ->
     KVs = create_range(Tenant, <<"interleaving_test">>, N),
     Mapper = create_mapping_on_range(Tenant, <<"interleaving_test">>, N, <<"hello world">>),
 
-    Vsn = erlfdb_nif:get_default_api_version(),
+    Vsn = erlfdb_port:get_default_api_version(),
 
     [R1, R2, R3, foobar, R4] = erlfdb:transactional(Tenant, fun(Tx) ->
         % F1 is a future doing a small get_range
@@ -162,7 +211,7 @@ interleaving_test() ->
                     [F1, F2, F3, foobar, vsn]
             end,
 
-        % wait_for_all_interleaving will wait on the first round o futures and then process to
+        % wait_for_all_interleaving will wait on the first round of futures and then process to
         % issue the necessary gets to the db in stages, interleaved with each other to help reduce
         % waiting on the network.
         erlfdb:wait_for_all_interleaving(Tx, Futures)
@@ -201,32 +250,11 @@ interleaving_test() ->
 
     ?assertEqual(KVs, SplitResult2).
 
-create_range(Tenant, Label, N) ->
-    KVs = [
-        {{Label, X}, {Label, <<($A + X - 1)>>}}
-     || X <- lists:seq(1, N)
-    ],
-
-    erlfdb:transactional(Tenant, fun(Tx) ->
-        [erlfdb:set(Tx, erlfdb_tuple:pack(K), erlfdb_tuple:pack(V)) || {K, V} <- KVs]
-    end),
-
-    KVs.
-
-create_mapping_on_range(Tenant, Label, N, Message) ->
-    erlfdb:transactional(Tenant, fun(Tx) ->
-        [
-            erlfdb:set(Tx, erlfdb_tuple:pack({Label, <<($A + X - 1)>>, <<"msg">>}), Message)
-         || X <- lists:seq(1, N)
-        ]
-    end),
-    {Label, <<"{V[1]}">>, <<"{...}">>}.
-
 % get_mapped_range requires the use of tuples in the keys/values so that the
 % element selector syntax can be used. This test demonstrates the minimal set
 % of keys necessary to exercise the feature.
-get_mapped_range_minimal_test() ->
-    Vsn = erlfdb_nif:get_default_api_version(),
+t_get_mapped_range_minimal() ->
+    Vsn = erlfdb_port:get_default_api_version(),
 
     if
         Vsn >= 730 ->
@@ -251,8 +279,8 @@ get_mapped_range_minimal_test() ->
             ok
     end.
 
-get_mapped_range_continuation_test() ->
-    Vsn = erlfdb_nif:get_default_api_version(),
+t_get_mapped_range_continuation() ->
+    Vsn = erlfdb_port:get_default_api_version(),
     if
         Vsn >= 730 ->
             N = 100,
@@ -280,7 +308,7 @@ get_mapped_range_continuation_test() ->
             ok
     end.
 
-flush_foregone_futures_test() ->
+t_flush_foregone_futures() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     erlfdb:transactional(Tenant, fun(Tx) -> erlfdb:set(Tx, <<"hello">>, <<"world">>) end),
@@ -308,7 +336,7 @@ flush_foregone_futures_test() ->
 
     ?assertMatch([], Leaks).
 
-versionstamp_test() ->
+t_versionstamp() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     VsFuture = erlfdb:transactional(Tenant, fun(Tx) ->
@@ -341,13 +369,14 @@ versionstamp_test() ->
     ?assert(is_binary(erlfdb:wait(VsFuture, [{timeout, 100}]))),
     ok.
 
-watch_test() ->
+t_watch() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
-    {erlfdb_future, MsgRef, _FRef} = erlfdb:transactional(Tenant, fun(Tx) ->
+    WatchFuture = erlfdb:transactional(Tenant, fun(Tx) ->
         erlfdb:set(Tx, <<"hello_watch">>, <<"foo">>),
         erlfdb:watch(Tx, <<"hello_watch">>)
     end),
+    MsgRef = future_msg_ref(WatchFuture),
     erlfdb:transactional(Tenant, fun(Tx) -> erlfdb:set(Tx, <<"hello_watch">>, <<"bar">>) end),
     receive
         {MsgRef, ready} ->
@@ -361,15 +390,15 @@ watch_test() ->
         error(timeout)
     end.
 
-watch_cancel_test() ->
+t_watch_cancel() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
-    Future =
-        {erlfdb_future, MsgRef, _FRef} = erlfdb:transactional(Tenant, fun(Tx) ->
-            erlfdb:set(Tx, <<"hello_watch">>, <<"foo">>),
-            erlfdb:watch(Tx, <<"hello_watch">>)
-        end),
-    ok = erlfdb:cancel(Future, [{flush, true}]),
+    WatchFuture = erlfdb:transactional(Tenant, fun(Tx) ->
+        erlfdb:set(Tx, <<"hello_watch">>, <<"foo">>),
+        erlfdb:watch(Tx, <<"hello_watch">>)
+    end),
+    MsgRef = future_msg_ref(WatchFuture),
+    ok = erlfdb:cancel(WatchFuture, [{flush, true}]),
     erlfdb:transactional(Tenant, fun(Tx) -> erlfdb:set(Tx, <<"hello_watch">>, <<"bar">>) end),
     receive
         {MsgRef, ready} ->
@@ -378,7 +407,7 @@ watch_cancel_test() ->
         ok
     end.
 
-watch_to_test() ->
+t_watch_to() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
 
@@ -402,10 +431,11 @@ watch_to_test() ->
         )
     end),
 
-    {erlfdb_future, MsgRef, _FRef} = erlfdb:transactional(Tenant, fun(Tx) ->
+    WatchFuture = erlfdb:transactional(Tenant, fun(Tx) ->
         erlfdb:set(Tx, <<"hello_watch">>, <<"foo">>),
         erlfdb:watch(Tx, <<"hello_watch">>, [{to, Pid}])
     end),
+    MsgRef = future_msg_ref(WatchFuture),
     Pid ! {MsgRef, new},
 
     erlfdb:transactional(Tenant, fun(Tx) -> erlfdb:set(Tx, <<"hello_watch">>, <<"bar">>) end),
@@ -417,7 +447,7 @@ watch_to_test() ->
         error(timeout)
     end.
 
-range_iterator_test() ->
+t_range_iterator() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     KVs = create_range(Tenant, <<"range_iterator_test">>, 3),
@@ -506,7 +536,7 @@ range_iterator_test() ->
     ),
 
     % GetMappedRange
-    Vsn = erlfdb_nif:get_default_api_version(),
+    Vsn = erlfdb_port:get_default_api_version(),
 
     if
         Vsn >= 730 ->
@@ -541,7 +571,7 @@ range_iterator_test() ->
 
 %% erlfdb_directory_cache tests
 
-directory_cache_create_or_open_test() ->
+t_directory_cache_create_or_open() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     Root = erlfdb_directory:root(),
@@ -551,7 +581,7 @@ directory_cache_create_or_open_test() ->
     Node = erlfdb_directory_cache:create_or_open(Table, Tenant, Root, Path),
     ?assertEqual([{utf8, <<"dir_cache_create_or_open">>}], erlfdb_directory:get_path(Node)).
 
-directory_cache_open_returns_cached_node_test() ->
+t_directory_cache_open_returns_cached_node() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     Root = erlfdb_directory:root(),
@@ -566,7 +596,7 @@ directory_cache_open_returns_cached_node_test() ->
     % Both calls must return the same term — the second is a cache hit.
     ?assertEqual(Node1, Node2).
 
-directory_cache_invalidate_test() ->
+t_directory_cache_invalidate() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     Root = erlfdb_directory:root(),
@@ -582,7 +612,7 @@ directory_cache_invalidate_test() ->
     ?assertEqual(erlfdb_directory:get_name(Node1), erlfdb_directory:get_name(Node2)),
     ?assertEqual(erlfdb_directory:get_path(Node1), erlfdb_directory:get_path(Node2)).
 
-directory_cache_open_missing_test() ->
+t_directory_cache_open_missing() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     Root = erlfdb_directory:root(),
@@ -594,7 +624,7 @@ directory_cache_open_missing_test() ->
         erlfdb_directory_cache:open(Table, Tenant, Root, Path)
     ).
 
-directory_cache_purge_all_test() ->
+t_directory_cache_purge_all() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     Root = erlfdb_directory:root(),
@@ -607,7 +637,7 @@ directory_cache_purge_all_test() ->
     erlfdb_directory_cache:purge(Table),
     ?assertEqual(0, ets:info(Table, size)).
 
-directory_cache_purge_ttl_test() ->
+t_directory_cache_purge_ttl() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     Root = erlfdb_directory:root(),
@@ -626,7 +656,7 @@ directory_cache_purge_ttl_test() ->
     Surviving = erlfdb_directory_cache:open(Table, Tenant, Root, [<<"purge_ttl_new">>]),
     ?assertEqual([{utf8, <<"purge_ttl_new">>}], erlfdb_directory:get_path(Surviving)).
 
-directory_cache_purge_keeps_fresh_test() ->
+t_directory_cache_purge_keeps_fresh() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     Root = erlfdb_directory:root(),
@@ -638,7 +668,7 @@ directory_cache_purge_keeps_fresh_test() ->
     erlfdb_directory_cache:purge(Table, 60000),
     ?assertEqual(1, ets:info(Table, size)).
 
-directory_cache_store_equivalent_to_open_test() ->
+t_directory_cache_store_equivalent_to_open() ->
     Db = erlfdb_sandbox:open(),
     Tenant = erlfdb_util:create_and_open_test_tenant(Db, [empty]),
     Root = erlfdb_directory:root(),
@@ -648,8 +678,6 @@ directory_cache_store_equivalent_to_open_test() ->
     Node = erlfdb_directory:create_or_open(Tenant, Root, Path),
 
     % Populate the cache manually via store, then retrieve via open.
-    % If store computes the same key as open_with_cache, open will hit the
-    % cache and return the identical term rather than going back to FDB.
     TableA = erlfdb_directory_cache:new(dir_cache_store_a),
     erlfdb_directory_cache:store(TableA, Root, Node),
     FromCache = erlfdb_directory_cache:open(TableA, Tenant, Root, Path),
@@ -662,6 +690,36 @@ directory_cache_store_equivalent_to_open_test() ->
     erlfdb_directory_cache:store(TableB, Root, Node),
     FromCacheB = erlfdb_directory_cache:open(TableB, Tenant, Root, Path),
     ?assertEqual(Node, FromCacheB).
+
+%% ---------------------------------------------------------------------------
+%% Helpers
+%% ---------------------------------------------------------------------------
+
+%% Returns the message ref used in {MsgRef, ready} notifications for a future,
+%% regardless of whether it is a NIF (ref at position 2) or port (ref at position 3) future.
+future_msg_ref({erlfdb_future, Worker, FutRef}) when is_pid(Worker) -> FutRef;
+future_msg_ref({erlfdb_future, MsgRef, _}) -> MsgRef.
+
+create_range(Tenant, Label, N) ->
+    KVs = [
+        {{Label, X}, {Label, <<($A + X - 1)>>}}
+     || X <- lists:seq(1, N)
+    ],
+
+    erlfdb:transactional(Tenant, fun(Tx) ->
+        [erlfdb:set(Tx, erlfdb_tuple:pack(K), erlfdb_tuple:pack(V)) || {K, V} <- KVs]
+    end),
+
+    KVs.
+
+create_mapping_on_range(Tenant, Label, N, Message) ->
+    erlfdb:transactional(Tenant, fun(Tx) ->
+        [
+            erlfdb:set(Tx, erlfdb_tuple:pack({Label, <<($A + X - 1)>>, <<"msg">>}), Message)
+         || X <- lists:seq(1, N)
+        ]
+    end),
+    {Label, <<"{V[1]}">>, <<"{...}">>}.
 
 get_set_get(DbOrTenant) ->
     Key = gen_key(8),
@@ -679,3 +737,16 @@ get_set_get(DbOrTenant) ->
 gen_key(Size) when is_integer(Size), Size > 1 ->
     RandBin = crypto:strong_rand_bytes(Size - 1),
     <<0, RandBin/binary>>.
+
+dir_cache_tables() ->
+    [
+        dir_cache_create_or_open,
+        dir_cache_open_cached,
+        dir_cache_invalidate,
+        dir_cache_open_missing,
+        dir_cache_purge_all,
+        dir_cache_purge_ttl,
+        dir_cache_purge_fresh,
+        dir_cache_store_a,
+        dir_cache_store_b
+    ].

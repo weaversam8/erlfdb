@@ -14,7 +14,18 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-get_addresses_for_key_test() ->
+-define(BACKENDS, [erlfdb_nif, erlfdb_port]).
+
+backends_test_() ->
+    Tests = [fun t_get_addresses_for_key/0],
+    [{atom_to_list(B),
+      {setup,
+       fun() -> application:set_env(erlfdb, backend, B) end,
+       fun(_) -> application:set_env(erlfdb, backend, erlfdb_port) end,
+       Tests}}
+     || B <- ?BACKENDS].
+
+t_get_addresses_for_key() ->
     Db = erlfdb_sandbox:open(),
     % Does not matter whether foo exists in Db
     Result = erlfdb:get_addresses_for_key(Db, <<"foo">>),

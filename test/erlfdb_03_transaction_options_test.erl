@@ -14,7 +14,26 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-get_approximate_tx_size_test() ->
+-define(BACKENDS, [erlfdb_nif, erlfdb_port]).
+
+backends_test_() ->
+    Tests = [
+        fun t_get_approximate_tx_size/0,
+        fun t_size_limit/0,
+        fun t_writes_allowed/0,
+        fun t_once_writes_happened_cannot_disallow_them/0,
+        fun t_has_watches/0,
+        fun t_cannot_set_watches_if_writes_disallowed/0,
+        fun t_size_limit_on_db_handle/0
+    ],
+    [{atom_to_list(B),
+      {setup,
+       fun() -> application:set_env(erlfdb, backend, B) end,
+       fun(_) -> application:set_env(erlfdb, backend, erlfdb_port) end,
+       Tests}}
+     || B <- ?BACKENDS].
+
+t_get_approximate_tx_size() ->
     Db1 = erlfdb_sandbox:open(),
     erlfdb:transactional(Db1, fun(Tx) ->
         ok = erlfdb:set(Tx, gen(10), gen(5000)),
@@ -25,7 +44,7 @@ get_approximate_tx_size_test() ->
         ?assert(TxSize2 > 10000)
     end).
 
-size_limit_test() ->
+t_size_limit() ->
     Db1 = erlfdb_sandbox:open(),
     ?assertError(
         {erlfdb_error, 2101},
@@ -35,7 +54,7 @@ size_limit_test() ->
         end)
     ).
 
-writes_allowed_test() ->
+t_writes_allowed() ->
     Db1 = erlfdb_sandbox:open(),
     ?assertError(
         writes_not_allowed,
@@ -53,7 +72,7 @@ writes_allowed_test() ->
         end)
     ).
 
-once_writes_happend_cannot_disallow_them_test() ->
+t_once_writes_happened_cannot_disallow_them() ->
     Db1 = erlfdb_sandbox:open(),
     ?assertError(
         badarg,
@@ -63,7 +82,7 @@ once_writes_happend_cannot_disallow_them_test() ->
         end)
     ).
 
-has_watches_test() ->
+t_has_watches() ->
     Db1 = erlfdb_sandbox:open(),
     {Before, After, AfterReset} = (erlfdb:transactional(Db1, fun(Tx) ->
         Before = erlfdb:has_watches(Tx),
@@ -77,7 +96,7 @@ has_watches_test() ->
     ?assert(After),
     ?assert(not AfterReset).
 
-cannot_set_watches_if_writes_disallowed_test() ->
+t_cannot_set_watches_if_writes_disallowed() ->
     Db1 = erlfdb_sandbox:open(),
     ?assertError(
         writes_not_allowed,
@@ -87,7 +106,7 @@ cannot_set_watches_if_writes_disallowed_test() ->
         end)
     ).
 
-size_limit_on_db_handle_test() ->
+t_size_limit_on_db_handle() ->
     Db1 = erlfdb_sandbox:open(),
     erlfdb:set_option(Db1, size_limit, 10000),
     ?assertError(
